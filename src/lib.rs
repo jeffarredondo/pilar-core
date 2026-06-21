@@ -1,6 +1,11 @@
-pub mod geometry;
-pub mod sharding;
-pub mod types;
-pub mod placement;
-pub mod ner;
-pub mod tfidf;
+mod geometry;
+mod sharding;
+mod types;
+mod placement;
+mod ner;
+mod tfidf;
+mod embed;
+mod ingest;
+mod enrich;
+mod km;
+pub mod pipeline;

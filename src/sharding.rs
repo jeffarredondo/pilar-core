@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::geometry::{poincare_distance, translate_to_origin};
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -23,6 +25,7 @@ impl Default for ShardingConfig {
 /// shard coordinates. This is the entire "map" — no separate disk, no
 /// second coordinate system, just a sparse set of points in the same H³
 /// every concept is already embedded in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardAnchor {
     pub shard_id: String,
     pub root_position: Vec<f64>,
@@ -104,6 +107,30 @@ impl ShardRegistry {
 
     pub fn anchor_count(&self) -> usize {
         self.anchors.len()
+    }
+
+    /// What km.rs needs to persist this registry's state to disk.
+    pub fn anchors(&self) -> &[ShardAnchor] {
+        &self.anchors
+    }
+
+    /// What km.rs needs to persist this registry's state to disk.
+    pub fn next_id(&self) -> usize {
+        self.next_id
+    }
+
+    /// Reconstructs a registry from previously-persisted state — the
+    /// gap flagged since this file was first built: ShardRegistry::new()
+    /// always started empty, so a resumed run could never find an
+    /// existing periphery shard to join, only ever spawn fresh ones.
+    ///
+    /// next_id is taken explicitly rather than re-derived by parsing the
+    /// numeric suffix off each anchor's shard_id — that would work today,
+    /// but ties correctness to a naming convention staying exactly
+    /// "periphery-{N}" forever. Persisting the counter directly doesn't
+    /// care what the IDs happen to look like.
+    pub fn load(anchors: Vec<ShardAnchor>, next_id: usize) -> Self {
+        Self { anchors, next_id }
     }
 }
 
@@ -188,6 +215,64 @@ mod tests {
             }
         }
         assert_eq!(registry.anchor_count(), 2);
+    }
+
+    #[test]
+    fn test_loaded_registry_continues_id_sequence_without_collision() {
+        // Simulates resuming a run where periphery-0 and periphery-1
+        // already exist on disk. A naive load() that reset next_id to 0
+        // would spawn a new "periphery-0", colliding with the real one.
+        let existing_anchors = vec![
+            ShardAnchor {
+                shard_id: "periphery-0".to_string(),
+                root_position: vec![0.92, 0.0, 0.0],
+            },
+            ShardAnchor {
+                shard_id: "periphery-1".to_string(),
+                root_position: vec![-0.92, 0.0, 0.0],
+            },
+        ];
+        let mut registry = ShardRegistry::load(existing_anchors, 2);
+        let config = ShardingConfig::default();
+
+        // Far from both existing anchors -- should spawn fresh, not join.
+        let assignment = registry.route(&[0.0, 0.92, 0.0], &config);
+
+        match assignment {
+            ShardAssignment::NewShard { shard_id, .. } => {
+                assert_eq!(shard_id, "periphery-2", "should continue from next_id, not restart at 0");
+            }
+            ShardAssignment::Joined { .. } => panic!("expected a new shard, not a join"),
+        }
+        assert_eq!(registry.anchor_count(), 3);
+    }
+
+    #[test]
+    fn test_loaded_registry_can_still_join_existing_anchors() {
+        let existing_anchors = vec![ShardAnchor {
+            shard_id: "periphery-0".to_string(),
+            root_position: vec![0.92, 0.0, 0.0],
+        }];
+        let mut registry = ShardRegistry::load(existing_anchors, 1);
+        let config = ShardingConfig::default();
+
+        let assignment = registry.route(&[0.93, 0.01, 0.0], &config);
+
+        match assignment {
+            ShardAssignment::Joined { shard_id, .. } => assert_eq!(shard_id, "periphery-0"),
+            ShardAssignment::NewShard { .. } => panic!("expected this point to join the loaded anchor"),
+        }
+        assert_eq!(registry.anchor_count(), 1, "joining shouldn't grow the loaded set");
+    }
+
+    #[test]
+    fn test_accessors_expose_what_km_needs_to_persist() {
+        let mut registry = ShardRegistry::new();
+        let config = ShardingConfig::default();
+        registry.route(&[0.92, 0.0, 0.0], &config);
+
+        assert_eq!(registry.anchors().len(), 1);
+        assert_eq!(registry.next_id(), 1);
     }
 
     #[test]

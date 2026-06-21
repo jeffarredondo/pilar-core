@@ -13,12 +13,19 @@ use crate::types::{Concept, GeometryConfidence, ManifoldCoord};
 // ── Input contract ────────────────────────────────────────────────────────────
 
 /// What ner.rs + tfidf.rs + embed.rs will eventually produce together —
-/// a scored term with its embedding attached. Defined here, not upstream,
-/// because those modules don't exist yet; this is placement's side of the
-/// contract, so there's something concrete to build toward.
+/// a term with its embedding attached, plus a pre-normalized strength
+/// value. Defined here, not upstream, because those modules don't exist
+/// yet; this is placement's side of the contract, so there's something
+/// concrete to build toward.
+///
+/// `strength` arrives already normalized to [0, 1] — placement doesn't
+/// know or care whether it came from TF-IDF, access-count decay, or
+/// anything else. Whoever produces an EmbeddedTerm owns normalizing
+/// their own raw signal before handing it off (see tfidf.rs's
+/// normalize_to_strength for the corpus-based version of that step).
 pub struct EmbeddedTerm {
     pub term: String,
-    pub tfidf_score: f64,
+    pub strength: f64,
     pub embedding: Vec<f64>,
     pub source_path: PathBuf,
     pub source_line: Option<usize>,
@@ -28,7 +35,10 @@ pub struct EmbeddedTerm {
 
 pub struct PlacementConfig {
     pub k_neighbors: usize,
-    pub tfidf_threshold: f64,
+    /// Minimum normalized strength to be placed at all. Interpreted
+    /// against the [0, 1] strength scale, not a raw producer-specific
+    /// score — same meaning regardless of what computed the strength.
+    pub strength_threshold: f64,
     /// Fixed seed for the random projections below. "Random" only means
     /// "arbitrary and fixed" here — same seed, same projections, every run.
     pub projection_seed: u64,
@@ -39,7 +49,7 @@ impl Default for PlacementConfig {
     fn default() -> Self {
         Self {
             k_neighbors: 5,
-            tfidf_threshold: 0.001,
+            strength_threshold: 0.001,
             projection_seed: 42,
             sharding: ShardingConfig::default(),
         }
@@ -87,7 +97,7 @@ impl Projections {
     }
 
     /// Unit direction in H³ — magnitude is deliberately discarded here.
-    /// Radius comes from TF-IDF strength elsewhere, not from this; this
+    /// Radius comes from strength elsewhere, not from this; this
     /// function only answers "which way," never "how far."
     pub fn hyperbolic_direction(&self, embedding: &[f64]) -> [f64; 3] {
         let raw = [
@@ -124,7 +134,7 @@ pub fn place(
 ) -> PlacementResult {
     let terms: Vec<EmbeddedTerm> = terms
         .into_iter()
-        .filter(|t| t.tfidf_score >= config.tfidf_threshold)
+        .filter(|t| t.strength >= config.strength_threshold)
         .collect();
 
     let mut result = PlacementResult {
@@ -136,7 +146,6 @@ pub fn place(
         return result;
     }
 
-    let max_score = terms.iter().map(|t| t.tfidf_score).fold(0.0_f64, f64::max);
     let embedding_dim = terms[0].embedding.len();
     let projections = Projections::new(embedding_dim, config.projection_seed);
 
@@ -146,7 +155,11 @@ pub fn place(
     let k = config.k_neighbors.min(n.saturating_sub(1));
 
     for (i, term) in terms.iter().enumerate() {
-        let strength = (term.tfidf_score / max_score).min(1.0);
+        // strength arrives already normalized -- no corpus-wide max to
+        // compute here. This is the whole point: place() doesn't know or
+        // care whether strength came from TF-IDF, access-count decay, or
+        // anything else, and shouldn't have to.
+        let strength = term.strength;
 
         // k nearest neighbors by embedding distance
         let mut neighbors: Vec<(usize, f64)> = (0..n).filter(|&j| j != i).map(|j| (j, d[(i, j)])).collect();
@@ -206,7 +219,7 @@ pub fn place(
             coordinate,
             confidence,
             embedding: term.embedding.clone(),
-            tfidf_score: term.tfidf_score,
+            strength: term.strength,
             source_path: term.source_path.clone(),
             source_line: term.source_line,
         };
@@ -244,10 +257,10 @@ pub fn place(
 mod tests {
     use super::*;
 
-    fn mock_term(term: &str, tfidf: f64, embedding: Vec<f64>) -> EmbeddedTerm {
+    fn mock_term(term: &str, strength: f64, embedding: Vec<f64>) -> EmbeddedTerm {
         EmbeddedTerm {
             term: term.into(),
-            tfidf_score: tfidf,
+            strength,
             embedding,
             source_path: PathBuf::from("test.md"),
             source_line: None,
@@ -300,9 +313,13 @@ mod tests {
     fn test_high_strength_lands_nearer_origin() {
         let mut registry = ShardRegistry::new();
         let config = PlacementConfig::default();
+        // 0.9 and 0.3, not 0.9 and 0.1 -- both need to stay comfortably
+        // inside the periphery cutoff (default 0.9) so this test cleanly
+        // checks radius ordering, not sharding routing. r(0.9) = 0.19,
+        // r(0.3) = 0.73, both well under the 0.9 cutoff.
         let terms = vec![
             mock_term("strong", 0.9, vec![0.1, 0.2, 0.3, 0.4, 0.5]),
-            mock_term("weak", 0.1, vec![0.4, 0.1, 0.5, 0.2, 0.3]),
+            mock_term("weak", 0.3, vec![0.4, 0.1, 0.5, 0.2, 0.3]),
         ];
         let result = place(terms, &config, &mut registry);
 
