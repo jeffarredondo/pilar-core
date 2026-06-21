@@ -27,8 +27,6 @@ Note: we need a thesis.md for this that goes into resonance, AL, and this paper 
       coordinates, hands periphery concepts to sharding
 - [x] `ner.rs` — RAKE + capitalization extraction (replaces spaCy)
 - [x] `tfidf.rs` — corpus-wide term scoring
-
-**Not started:**
 - [x] `embed.rs` — Ollama embedding client (placement needs this)
 - [x] `ingest.rs` — chunking (tfidf needs this)
 - [x] Enrichment — small-model description, larger-model naming
