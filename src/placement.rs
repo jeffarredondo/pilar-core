@@ -39,6 +39,21 @@ pub struct PlacementConfig {
     /// against the [0, 1] strength scale, not a raw producer-specific
     /// score — same meaning regardless of what computed the strength.
     pub strength_threshold: f64,
+    /// Hard cap on placed concepts, keeping the strongest N after the
+    /// threshold filter. None means no cap.
+    ///
+    /// This is NOT a noise filter — tfidf.rs's min_occurrences already
+    /// does that job, upstream, before a term is even scored. By the
+    /// time terms reach this cap they've already cleared "did this
+    /// actually recur in the corpus." Truncating that already-curated
+    /// set to the top N is a resource/scope decision (enrichment costs
+    /// ~2 Ollama calls per concept; real corpora produced 1000+
+    /// genuinely-recurring terms, which is hours of enrichment, not
+    /// minutes) — the same role Python's n_top played after min_tf,
+    /// just correctly ordered this time. A cap applied to an unfiltered
+    /// pool would be arbitrary; a cap applied after a real recurrence
+    /// floor is just "how many of the good candidates can we afford."
+    pub max_concepts: Option<usize>,
     /// Fixed seed for the random projections below. "Random" only means
     /// "arbitrary and fixed" here — same seed, same projections, every run.
     pub projection_seed: u64,
@@ -50,6 +65,7 @@ impl Default for PlacementConfig {
         Self {
             k_neighbors: 5,
             strength_threshold: 0.001,
+            max_concepts: Some(100),
             projection_seed: 42,
             sharding: ShardingConfig::default(),
         }
@@ -132,10 +148,20 @@ pub fn place(
     config: &PlacementConfig,
     registry: &mut ShardRegistry,
 ) -> PlacementResult {
-    let terms: Vec<EmbeddedTerm> = terms
+    let mut terms: Vec<EmbeddedTerm> = terms
         .into_iter()
         .filter(|t| t.strength >= config.strength_threshold)
         .collect();
+
+    if let Some(max) = config.max_concepts {
+        // Strongest first, so truncate keeps the top N, not an
+        // arbitrary N. Applied here -- before distance_matrix,
+        // eigenvalue_signature, and the rest of the per-term geometry
+        // work below -- so capping also saves real computation, not
+        // just enrichment time downstream.
+        terms.sort_by(|a, b| b.strength.partial_cmp(&a.strength).unwrap());
+        terms.truncate(max);
+    }
 
     let mut result = PlacementResult {
         root: Vec::new(),
@@ -333,6 +359,42 @@ mod tests {
         let strong = result.root.iter().find(|c| c.raw_term == "strong").unwrap();
         let weak = result.root.iter().find(|c| c.raw_term == "weak").unwrap();
         assert!(radius_of(strong) < radius_of(weak));
+    }
+
+    #[test]
+    fn test_max_concepts_caps_to_strongest_terms() {
+        let mut registry = ShardRegistry::new();
+        let config = PlacementConfig {
+            max_concepts: Some(2),
+            ..PlacementConfig::default()
+        };
+        let terms = vec![
+            mock_term("weakest", 0.1, vec![0.1, 0.2, 0.3, 0.4]),
+            mock_term("middle", 0.5, vec![0.2, 0.3, 0.1, 0.4]),
+            mock_term("strongest", 0.9, vec![0.3, 0.1, 0.4, 0.2]),
+        ];
+        let result = place(terms, &config, &mut registry);
+        let all: Vec<&Concept> = result.root.iter().chain(result.periphery.values().flatten()).collect();
+
+        assert_eq!(all.len(), 2, "should keep exactly max_concepts, not everything above threshold");
+        assert!(all.iter().any(|c| c.raw_term == "strongest"));
+        assert!(all.iter().any(|c| c.raw_term == "middle"));
+        assert!(all.iter().all(|c| c.raw_term != "weakest"), "weakest term should be the one dropped");
+    }
+
+    #[test]
+    fn test_max_concepts_none_means_no_cap() {
+        let mut registry = ShardRegistry::new();
+        let config = PlacementConfig {
+            max_concepts: None,
+            ..PlacementConfig::default()
+        };
+        let terms: Vec<EmbeddedTerm> = (0..10)
+            .map(|i| mock_term(&format!("term{i}"), 0.5, vec![i as f64 * 0.1, 0.2, 0.3, 0.4]))
+            .collect();
+        let result = place(terms, &config, &mut registry);
+        let total = result.root.len() + result.periphery.values().map(|v| v.len()).sum::<usize>();
+        assert_eq!(total, 10, "None should place everything that passed the strength threshold");
     }
 
     #[test]
