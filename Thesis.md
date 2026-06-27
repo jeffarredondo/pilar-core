@@ -5,7 +5,7 @@
 Large language models hallucinate. Small language models hallucinate more. But
 the failure mode isn't randomness — it's *ungrounded* generation. A model given
 no context invents context. A model given the right context can reason coherently
-even at 14M parameters, as demonstrated by smaLLM: a character-level transformer
+even at 24M parameters, as demonstrated by smaLLM: a character-level transformer
 trained exclusively on Les Misérables that produced incoherent output in isolation
 but became a consistent character when given structured memory and period-appropriate
 linguistic framing.
@@ -113,7 +113,7 @@ The manifold is queryable. The geometry is meaningful. The lazy loading works.
 
 ## The Bet
 
-A 14M parameter model given the right 5 sentences of context will outperform a
+A 7B parameter model given the right 5 sentences of context will outperform a
 70B parameter model given no context on a specific domain question. Pilar is the
 system that finds those 5 sentences geometrically, from a persistent manifold built
 from real source material, without hallucinating facts that aren't there.
