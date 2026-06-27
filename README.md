@@ -272,4 +272,7 @@ cargo run --release -- \
   --output ./km_output \
   --dry-run
 
+# manifold test
+cargo run --bin infer --release    
+
 ```
