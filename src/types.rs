@@ -91,6 +91,7 @@ pub struct Concept {
     /// Stored once, reused for cross-geometry bridging — this is what
     /// fixes the old Python bug where match_to_disk re-embedded every
     /// disk concept on every single query instead of reusing this.
+    #[serde(skip)]
     pub embedding: Vec<f64>,
     /// Normalized [0, 1] confidence signal — how reinforced is this concept.
     /// Source-agnostic deliberately: today it's always TF-IDF-derived, but

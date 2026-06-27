@@ -45,16 +45,15 @@ impl From<toml::ser::Error> for KmError {
 
 // ── Shard ─────────────────────────────────────────────────────────────────────
 
-/// One shard's worth of concepts on disk -- root or periphery, identical
-/// shape either way, since periphery concepts already carry their own
-/// recentered local coordinates by the time placement.rs hands them off.
+/// One shard's worth of concepts on disk. Every shard has the same shape —
+/// concepts keyed by raw_term, carrying local coordinates already recentered
+/// into this shard's own frame via Möbius translation at ingestion time.
+/// No shard is privileged: shard-0 is just the first one created, not a
+/// "root." The registry holds the spatial index; this holds the concepts.
 ///
 /// Keyed by raw_term, not label. label is the LLM's probabilistic name
-/// and can collide across concepts -- Python's own pipeline had to
-/// disambiguate colliding names with a suffix. raw_term is deterministic
-/// and guaranteed unique within a single placement run by construction:
-/// tfidf.rs aggregates by unique term string, so every unique raw_term
-/// produces exactly one ScoredTerm, which produces exactly one Concept.
+/// and can collide across concepts. raw_term is deterministic and guaranteed
+/// unique within a single placement run by construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Shard {
     pub shard_id: String,
@@ -82,7 +81,9 @@ pub fn read_shard(path: &Path) -> Result<Shard, KmError> {
 
 /// What gets written to disk to resume a ShardRegistry across runs.
 /// next_id is persisted explicitly rather than re-derived from anchor
-/// shard_ids on load -- see ShardRegistry::load's doc comment for why.
+/// shard_ids on load — deriving it from the "shard-{N}" suffix would
+/// tie correctness to a naming convention staying exactly that forever.
+/// Persisting the counter directly doesn't care what the IDs look like.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistrySnapshot {
     pub anchors: Vec<ShardAnchor>,
@@ -135,8 +136,6 @@ mod tests {
         }
     }
 
-    // Unique-per-process temp paths -- cargo test runs files in parallel
-    // by default, so a shared fixed filename would race.
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("pilar_test_{label}_{}.km", std::process::id()))
     }
@@ -146,10 +145,10 @@ mod tests {
         let path = temp_path("shard_roundtrip");
         let concepts = vec![mock_concept("manifold"), mock_concept("geometry")];
 
-        write_shard(&concepts, "root", &path).unwrap();
+        write_shard(&concepts, "shard-0", &path).unwrap();
         let loaded = read_shard(&path).unwrap();
 
-        assert_eq!(loaded.shard_id, "root");
+        assert_eq!(loaded.shard_id, "shard-0");
         assert_eq!(loaded.concepts.len(), 2);
         let c = loaded.concepts.get("manifold").unwrap();
         assert_eq!(c.label, "manifold_label");
@@ -172,7 +171,7 @@ mod tests {
         let mut flat = mock_concept("f_concept");
         flat.coordinate = ManifoldCoord::Flat { position: vec![0.5] };
 
-        write_shard(&[hyperbolic, spherical, flat], "root", &path).unwrap();
+        write_shard(&[hyperbolic, spherical, flat], "shard-0", &path).unwrap();
         let loaded = read_shard(&path).unwrap();
 
         match &loaded.concepts["h_concept"].coordinate {
@@ -193,13 +192,11 @@ mod tests {
 
     #[test]
     fn test_concept_with_no_source_line_roundtrips() {
-        // The actual reason for skip_serializing_if -- a None here used
-        // to be the risky case with the toml crate specifically.
         let path = temp_path("no_source_line");
         let mut c = mock_concept("no_line");
         c.source_line = None;
 
-        write_shard(&[c], "root", &path).unwrap();
+        write_shard(&[c], "shard-0", &path).unwrap();
         let loaded = read_shard(&path).unwrap();
 
         assert_eq!(loaded.concepts["no_line"].source_line, None);
@@ -210,22 +207,22 @@ mod tests {
     fn test_registry_roundtrip_preserves_routing_behavior() {
         let path = temp_path("registry");
 
+        // ShardRegistry::new() pre-registers shard-0 at the origin.
+        // Two more routes give us shard-1 and shard-2.
         let mut registry = ShardRegistry::new();
         let config = ShardingConfig::default();
-        registry.route(&[0.92, 0.0, 0.0], &config);
-        registry.route(&[-0.92, 0.0, 0.0], &config);
+        registry.route(&[0.92, 0.0, 0.0], &config);   // shard-1
+        registry.route(&[-0.92, 0.0, 0.0], &config);  // shard-2
 
         write_registry(&registry, &path).unwrap();
         let mut loaded = read_registry(&path).unwrap();
 
-        assert_eq!(loaded.anchor_count(), 2);
+        assert_eq!(loaded.anchor_count(), 3); // shard-0, shard-1, shard-2
 
-        // The real test: a loaded registry has to keep routing correctly
-        // -- continuing the id sequence, not colliding with what's
-        // already on disk.
+        // A loaded registry must continue the ID sequence without collision.
         let assignment = loaded.route(&[0.0, 0.92, 0.0], &config);
         match assignment {
-            ShardAssignment::NewShard { shard_id, .. } => assert_eq!(shard_id, "periphery-2"),
+            ShardAssignment::NewShard { shard_id, .. } => assert_eq!(shard_id, "shard-3"),
             ShardAssignment::Joined { .. } => panic!("expected a new shard"),
         }
 

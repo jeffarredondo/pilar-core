@@ -152,19 +152,14 @@ fn rank_chunks_by_signal_density<'a>(
 fn build_summarize_prompt(raw_term: &str, context: &str) -> String {
     format!(
         "You are summarizing a text document.\n\
-Using ONLY the information explicitly present in these excerpts, complete this sentence in exactly one sentence:\n\
-\"{raw_term} is...\"\n\
-\n\
-Rules:\n\
-- Only use what is directly written in the text\n\
-- Do not interpret, infer, or add context beyond what is explicitly stated\n\
-- Do not add outside knowledge\n\
-- If the text does not clearly describe {raw_term}, say \"{raw_term} is a concept mentioned in this text.\"\n\
+Write exactly one sentence describing what \"{raw_term}\" refers to in the excerpts below.\n\
+Use only information explicitly present in the text — do not interpret, infer, or add outside knowledge.\n\
+If the excerpts do not clearly describe \"{raw_term}\", write: \"This text mentions {raw_term} without a clear description.\"\n\
 \n\
 TEXT EXCERPTS:\n\
 {context}\n\
 \n\
-Complete the sentence \"{raw_term} is...\" in exactly one sentence:"
+One sentence description of \"{raw_term}\" based only on the text above:"
     )
 }
 
@@ -331,9 +326,9 @@ mod tests {
     #[test]
     fn test_summarize_prompt_contains_guardrails() {
         let prompt = build_summarize_prompt("manifold", "some excerpt text");
-        assert!(prompt.contains("Only use what is directly written"));
-        assert!(prompt.contains("Do not add outside knowledge"));
-        assert!(prompt.contains("manifold is..."));
+        assert!(prompt.contains("do not interpret"));
+        assert!(prompt.contains("outside knowledge"));
+        assert!(prompt.contains("without a clear description"));
     }
 
     #[test]

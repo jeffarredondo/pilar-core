@@ -1,95 +1,139 @@
 use std::collections::HashSet;
 
-use rake::{Rake, StopWords};
 use stop_words::{get, LANGUAGE};
 
 // ── Stopwords ─────────────────────────────────────────────────────────────────
 
-/// Reuses the same stop-words crate the old tfidf.rs already depended on,
-/// rather than hand-rolling a list — one source of truth for "what's noise"
-/// instead of two lists that could quietly drift apart.
-fn build_stopwords() -> StopWords {
-    let set: HashSet<String> = get(LANGUAGE::English).into_iter().collect();
-    StopWords::from(set)
+/// Same stop-words crate tfidf.rs already uses — one source of truth for
+/// "what's noise" rather than two lists that could quietly drift apart.
+fn build_stopword_set() -> HashSet<String> {
+    get(LANGUAGE::English).into_iter().collect()
 }
 
-// ── Capitalization heuristic ──────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────────
 
-/// A "proper noun phrase" is a run of consecutive capitalized words. This
-/// will mis-flag sentence-initial words sometimes (no easy way to tell
-/// "The" starting a sentence from "The" in a real title without actual
-/// sentence boundary detection) — same kind of noise spaCy's statistical
-/// NER had anyway, and tfidf.rs's corpus-wide scoring is what's supposed
-/// to wash out one-off noise like that, not this function.
-fn capitalized_phrases(text: &str) -> HashSet<String> {
-    let mut phrases = HashSet::new();
-    let mut current: Vec<&str> = Vec::new();
+/// Controls n-gram extraction. `max_n` is deliberately left as a runtime
+/// parameter rather than a compile-time constant — the right value isn't
+/// known yet and needs to be determined empirically by running real corpora
+/// through different sizes and inspecting output. Start with 3 and adjust.
+pub struct NerConfig {
+    /// Maximum n-gram length to emit. Unigrams (n=1) through max_n are
+    /// all candidates — corpus-wide TF-IDF and min_occurrences do the
+    /// actual curation, not this layer.
+    pub max_n: usize,
+}
 
-    let is_cap_word = |w: &str| -> bool {
-        w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) && w.chars().any(|c| c.is_alphabetic())
-    };
+impl Default for NerConfig {
+    fn default() -> Self {
+        Self { max_n: 3 }
+    }
+}
 
-    let flush = |current: &mut Vec<&str>, phrases: &mut HashSet<String>| {
-        if !current.is_empty() {
-            let phrase = current.join(" ").to_lowercase();
-            if phrase.len() > 2 {
-                phrases.insert(phrase);
+// ── Tokenizer ─────────────────────────────────────────────────────────────────
+
+/// Strips punctuation from both ends of a word, lowercases, drops empties.
+/// Inline rather than a crate — the only thing needed is "alphanumeric
+/// characters of a token, lowercase," not a full tokenization pipeline.
+fn tokenize(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|raw| {
+            let t = raw.trim_matches(|c: char| !c.is_alphanumeric());
+            if t.is_empty() { None } else { Some(t.to_lowercase()) }
+        })
+        .collect()
+}
+
+// ── N-gram extraction ─────────────────────────────────────────────────────────
+
+/// Slides windows of size 1..=max_n over the token stream and keeps every
+/// window whose first and last token are both non-stopwords. Internal
+/// stopwords are fine — "bank of america" passes (edges are content words),
+/// "of the bank" fails (starts on a stopword). Single-token windows are
+/// included so genuine anchor concepts like "witchcraft" survive on their
+/// own rather than only ever appearing folded into a bigram.
+///
+/// Overlap between n-grams of different lengths ("spacex", "spacex rocket",
+/// "rocket") is intentional and not resolved here. Consolidating subsuming
+/// concepts is a future vacuum/maintenance step over the manifold, not
+/// ingestion's job — same reasoning as the Gutenberg-ranking-#1 call: don't
+/// editorialize at extraction time about what's "really" one concept vs.
+/// several, let density and geometry decide later.
+fn ngram_terms(tokens: &[String], stopwords: &HashSet<String>, max_n: usize) -> HashSet<String> {
+    let mut terms = HashSet::new();
+
+    for n in 1..=max_n {
+        for window in tokens.windows(n) {
+            let first = &window[0];
+            let last = &window[window.len() - 1];
+
+            // Both edges must be content words — internal stopwords are fine.
+            if stopwords.contains(first) || stopwords.contains(last) {
+                continue;
             }
-            current.clear();
-        }
-    };
 
-    for raw_word in text.split_whitespace() {
-        let trimmed = raw_word.trim_matches(|c: char| !c.is_alphanumeric());
-        if trimmed.is_empty() {
-            flush(&mut current, &mut phrases);
-            continue;
-        }
-        if is_cap_word(trimmed) {
-            current.push(trimmed);
-        } else {
-            flush(&mut current, &mut phrases);
+            let phrase = window.join(" ");
+
+            // Mirror the old length floor — single characters and two-char
+            // fragments are noise by any measure.
+            if phrase.len() > 2 {
+                terms.insert(phrase);
+            }
         }
     }
-    flush(&mut current, &mut phrases);
 
-    phrases
+    terms
 }
 
-// ── RAKE phrases ──────────────────────────────────────────────────────────────
+// ── Extractor ─────────────────────────────────────────────────────────────────
 
-fn rake_phrases(text: &str, rake: &Rake) -> HashSet<String> {
-    // No score threshold here deliberately — RAKE already only returns
-    // content phrases (it splits candidates apart at stopword/punctuation
-    // boundaries, so stopword-only text never produces a candidate at
-    // all). Real signal-vs-noise separation happens corpus-wide in
-    // tfidf.rs, same division of labor extract_concepts_from_chunk /
-    // build_tfidf had in the Python version — filtering here would risk
-    // discarding a term before TF-IDF ever gets to evaluate it.
-    rake.run(text)
-        .into_iter()
-        .map(|k| k.keyword.to_lowercase())
-        .filter(|k| k.len() > 2)
-        .collect()
+/// Holds the stopword set so it's built once and reused across every chunk
+/// in a corpus rather than reconstructed per call.
+pub struct Extractor {
+    stopwords: HashSet<String>,
+    config: NerConfig,
+}
+
+impl Extractor {
+    pub fn new(config: NerConfig) -> Self {
+        Self {
+            stopwords: build_stopword_set(),
+            config,
+        }
+    }
+}
+
+impl Default for Extractor {
+    fn default() -> Self {
+        Self::new(NerConfig::default())
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Extracts candidate concept terms from a single chunk of text — the
-/// direct replacement for spaCy's NER + noun_chunks in extract_concepts_
-/// from_chunk. Combines RAKE candidate phrases with capitalized entity
-/// phrases, deduped. No model load, no inference — pure text processing,
-/// same complexity class as counting words.
-pub fn extract_terms(text: &str, rake: &Rake) -> HashSet<String> {
-    let mut terms = rake_phrases(text, rake);
-    terms.extend(capitalized_phrases(text));
-    terms
+/// Extracts candidate concept terms from a single chunk of text. Replaces
+/// the old RAKE + capitalized_phrases combination — both had the same
+/// underlying fragmentation bug (RAKE splits at stopwords, capitalized_phrases
+/// splits at non-capitalized words, both fragment "Bank of America" at "of").
+/// Sliding-window n-grams generalize RAKE's idea without that constraint:
+/// edges must be content words, internal stopwords are allowed.
+///
+/// Output type is unchanged — still `HashSet<String>` — so tfidf.rs,
+/// embed.rs, placement.rs, and enrich.rs need zero changes.
+pub fn extract_terms(text: &str, extractor: &Extractor) -> HashSet<String> {
+    let tokens = tokenize(text);
+    ngram_terms(&tokens, &extractor.stopwords, extractor.config.max_n)
 }
 
-/// Builds the Rake instance once — reuse this across every chunk in a
-/// corpus rather than rebuilding the stopword set per call.
-pub fn build_extractor() -> Rake {
-    Rake::new(build_stopwords())
+/// Builds the extractor once. Pass the result into every `extract_terms`
+/// call for a corpus — same usage pattern as the old `build_extractor`/`Rake`.
+pub fn build_extractor() -> Extractor {
+    Extractor::default()
+}
+
+/// Builds the extractor with explicit config — use this when you want to
+/// compare max_n values across runs rather than taking the default.
+pub fn build_extractor_with_config(config: NerConfig) -> Extractor {
+    Extractor::new(config)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -98,38 +142,135 @@ pub fn build_extractor() -> Rake {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_extracts_proper_nouns() {
-        let rake = build_extractor();
-        let text = "SpaceX reported revenue growth. Elon Musk remains Chief Executive Officer.";
-        let terms = extract_terms(text, &rake);
+    fn stopwords() -> HashSet<String> {
+        build_stopword_set()
+    }
 
-        assert!(terms.iter().any(|t| t.contains("spacex")));
-        assert!(terms.iter().any(|t| t.contains("elon musk")));
+    // ── ngram_terms unit tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_unigram_content_word_included() {
+        let sw = stopwords();
+        let tokens = vec!["witchcraft".to_string()];
+        let terms = ngram_terms(&tokens, &sw, 3);
+        assert!(terms.contains("witchcraft"));
     }
 
     #[test]
-    fn test_stopword_only_text_yields_nothing() {
-        let rake = build_extractor();
-        let text = "the a an of to in on at";
-        let terms = extract_terms(text, &rake);
+    fn test_unigram_stopword_excluded() {
+        let sw = stopwords();
+        let tokens = vec!["the".to_string()];
+        let terms = ngram_terms(&tokens, &sw, 3);
         assert!(terms.is_empty());
     }
 
     #[test]
+    fn test_bigram_internal_stopword_allowed() {
+        // "bank of america" — "of" is a stopword but edges are content words.
+        let sw = stopwords();
+        let tokens = vec!["bank".to_string(), "of".to_string(), "america".to_string()];
+        let terms = ngram_terms(&tokens, &sw, 3);
+        assert!(terms.contains("bank of america"), "got: {:?}", terms);
+    }
+
+    #[test]
+    fn test_bigram_leading_stopword_excluded() {
+        // "of the bank" — starts on a stopword, should be dropped.
+        let sw = stopwords();
+        let tokens = vec!["of".to_string(), "the".to_string(), "bank".to_string()];
+        let terms = ngram_terms(&tokens, &sw, 3);
+        assert!(!terms.contains("of the bank"), "got: {:?}", terms);
+    }
+
+    #[test]
+    fn test_bigram_trailing_stopword_excluded() {
+        let sw = stopwords();
+        let tokens = vec!["bank".to_string(), "of".to_string()];
+        let terms = ngram_terms(&tokens, &sw, 2);
+        assert!(!terms.contains("bank of"), "got: {:?}", terms);
+    }
+
+    #[test]
+    fn test_ngrams_up_to_max_n_only() {
+        let sw = stopwords();
+        // Four content words — with max_n=2 we should get unigrams and bigrams
+        // but no trigrams or 4-grams.
+        let tokens = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string(), "delta".to_string()];
+        let terms = ngram_terms(&tokens, &sw, 2);
+        assert!(terms.contains("alpha beta"));
+        assert!(!terms.contains("alpha beta gamma"));
+    }
+
+    #[test]
+    fn test_length_floor_applied() {
+        let sw = stopwords();
+        // Two-character token shouldn't survive even if it's not a stopword.
+        let tokens = vec!["ok".to_string()];
+        let terms = ngram_terms(&tokens, &sw, 1);
+        assert!(terms.is_empty());
+    }
+
+    // ── extract_terms integration tests ──────────────────────────────────────
+
+    #[test]
+    fn test_extracts_proper_nouns() {
+        let extractor = build_extractor();
+        let text = "SpaceX reported revenue growth. Elon Musk remains Chief Executive Officer.";
+        let terms = extract_terms(text, &extractor);
+
+        assert!(terms.iter().any(|t| t.contains("spacex")), "got: {:?}", terms);
+        assert!(terms.iter().any(|t| t.contains("elon musk")), "got: {:?}", terms);
+    }
+
+    #[test]
+    fn test_stopword_only_text_yields_nothing() {
+        let extractor = build_extractor();
+        let text = "the a an of to in on at";
+        let terms = extract_terms(text, &extractor);
+        assert!(terms.is_empty(), "got: {:?}", terms);
+    }
+
+    #[test]
     fn test_deterministic_across_calls() {
-        let rake = build_extractor();
+        let extractor = build_extractor();
         let text = "Jean Valjean spent nineteen years in the galleys at Toulon.";
-        let a = extract_terms(text, &rake);
-        let b = extract_terms(text, &rake);
+        let a = extract_terms(text, &extractor);
+        let b = extract_terms(text, &extractor);
         assert_eq!(a, b);
     }
 
     #[test]
     fn test_short_fragments_filtered() {
-        let rake = build_extractor();
+        let extractor = build_extractor();
         let text = "ok an it is";
-        let terms = extract_terms(text, &rake);
+        let terms = extract_terms(text, &extractor);
         assert!(terms.iter().all(|t| t.len() > 2));
+    }
+
+    #[test]
+    fn test_internal_stopword_phrase_survives() {
+        // The old RAKE path would fragment "bank of america" at "of".
+        // N-gram extraction should keep it intact.
+        let extractor = build_extractor();
+        let text = "Bank of America reported earnings.";
+        let terms = extract_terms(text, &extractor);
+        assert!(terms.iter().any(|t| t == "bank of america"), "got: {:?}", terms);
+    }
+
+    #[test]
+    fn test_max_n_config_respected() {
+        let extractor = build_extractor_with_config(NerConfig { max_n: 1 });
+        let text = "orbital mechanics governs trajectories.";
+        let terms = extract_terms(text, &extractor);
+        // With max_n=1, no multi-word phrases should appear.
+        assert!(terms.iter().all(|t| !t.contains(' ')), "got: {:?}", terms);
+    }
+
+    #[test]
+    fn test_max_n_2_produces_bigrams() {
+        let extractor = build_extractor_with_config(NerConfig { max_n: 2 });
+        let text = "orbital mechanics governs trajectories.";
+        let terms = extract_terms(text, &extractor);
+        assert!(terms.iter().any(|t| t.contains(' ')), "got: {:?}", terms);
     }
 }

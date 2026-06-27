@@ -22,6 +22,10 @@ pub struct PipelineConfig {
     pub placement: PlacementConfig,
     pub enrich: EnrichConfig,
     pub output_dir: PathBuf,
+    /// Cap applied per source file before pooling. Each corpus contributes
+    /// at most this many concepts, regardless of corpus size. None means
+    /// no cap. Placement itself applies no additional cap.
+    pub max_concepts_per_source: Option<usize>,
 }
 
 impl Default for PipelineConfig {
@@ -33,6 +37,7 @@ impl Default for PipelineConfig {
             placement: PlacementConfig::default(),
             enrich: EnrichConfig::default(),
             output_dir: PathBuf::from("."),
+            max_concepts_per_source: Some(100),
         }
     }
 }
@@ -83,37 +88,42 @@ impl From<KmError> for PipelineError {
 
 // ── Stage 1: ingest + extract + score ─────────────────────────────────────────
 
-/// Chunks every source file, extracts candidate terms per chunk, and
-/// scores them across the full corpus -- ingest.rs, ner.rs, and tfidf.rs
-/// chained in the order each was built against. Only I/O here is reading
-/// the source files themselves; everything past that is pure.
+/// Chunks and scores each source file independently, taking the top
+/// max_concepts_per_source from each before pooling. Scoring per-source
+/// rather than across the full corpus means TF-IDF reflects each document's
+/// own term distribution — a term dominant in Brandenburg scores on
+/// Brandenburg's scale, not diluted by SpaceX's volume. The tradeoff
+/// is that cross-corpus strength normalization in place_corpus runs
+/// against these source-relative scores, which is acceptable given
+/// that the top N per source already represents the high signal-density
+/// concepts worth placing.
 pub fn ingest_and_score(source_paths: &[PathBuf], config: &PipelineConfig) -> Result<(Vec<Chunk>, Vec<ScoredTerm>), PipelineError> {
     let extractor = ner::build_extractor();
-
     let mut all_chunks = Vec::new();
+    let mut all_scores = Vec::new();
+
     for path in source_paths {
         let chunks = ingest::chunk_file(path, &config.ingest)?;
+        let terms_per_chunk: Vec<HashSet<String>> = chunks.iter()
+            .map(|c| ner::extract_terms(&c.text, &extractor))
+            .collect();
+        let mut scores = tfidf::compute(&chunks, &terms_per_chunk, &config.tfidf);
+
+        if let Some(max) = config.max_concepts_per_source {
+            scores.truncate(max);
+        }
+
         all_chunks.extend(chunks);
+        all_scores.extend(scores);
     }
 
-    let terms_per_chunk: Vec<HashSet<String>> = all_chunks.iter().map(|c| ner::extract_terms(&c.text, &extractor)).collect();
-
-    let scores = tfidf::compute(&all_chunks, &terms_per_chunk, &config.tfidf);
-
-    Ok((all_chunks, scores))
+    Ok((all_chunks, all_scores))
 }
 
-// ── Stage 2: embedding (real I/O -- not part of the testable core) ───────────
+// ── Stage 2: embedding ────────────────────────────────────────────────────────
 
-/// Embeds every scored term via Ollama. The one stage with no honest
-/// local stand-in -- there's no way to fake what a real embedding model
-/// produces, so this isn't covered by cargo test, the same boundary
-/// embed.rs itself draws between embed() and parse_embedding().
-///
-/// Aborts on the first failure rather than skipping and continuing --
-/// matches the Python prototype's behavior (get_embedding had no retry
-/// or partial-failure handling either), not a robustness gap introduced
-/// here. Worth revisiting if a real run hits it, not before.
+/// Embeds every scored term via Ollama. Aborts on the first failure rather
+/// than skipping and continuing — matches the Python prototype's behavior.
 pub fn embed_terms(scores: &[ScoredTerm], config: &EmbedConfig) -> Result<HashMap<String, Vec<f64>>, PipelineError> {
     let mut embeddings = HashMap::with_capacity(scores.len());
     for term in scores {
@@ -123,17 +133,11 @@ pub fn embed_terms(scores: &[ScoredTerm], config: &EmbedConfig) -> Result<HashMa
     Ok(embeddings)
 }
 
-// ── Stage 3: placement (pure given embeddings) ────────────────────────────────
+// ── Stage 3: placement ────────────────────────────────────────────────────────
 
 /// Places already-scored terms on the manifold, given their embeddings.
-/// Takes embeddings as a plain lookup instead of computing them itself
-/// -- that's what keeps this testable without a live Ollama: a test can
-/// hand it any HashMap of the right shape, production code hands it
-/// embed_terms' real output. A term with no matching embedding is
-/// skipped rather than panicking -- defensive for this function used
-/// standalone; unreachable in the real pipeline, since embed_terms
-/// aborts entirely on any single failure rather than returning partial
-/// results.
+/// Takes embeddings as a plain lookup so this is testable without Ollama.
+/// A term with no matching embedding is skipped rather than panicking.
 pub fn place_corpus(
     scores: &[ScoredTerm],
     embeddings: &HashMap<String, Vec<f64>>,
@@ -158,13 +162,9 @@ pub fn place_corpus(
     placement::place(terms, config, registry)
 }
 
-// ── Stage 4: enrichment (real I/O -- not part of the testable core) ──────────
+// ── Stage 4: enrichment ───────────────────────────────────────────────────────
 
-/// Runs both enrichment steps over every placed concept, in place. Real
-/// I/O (two Ollama chat calls per concept), so not unit-tested here for
-/// the same reason embedding isn't -- this is the stage expected to
-/// dominate wall-clock time, per the original concern that motivated
-/// adding timing instrumentation to this file in the first place.
+/// Runs both enrichment steps over every placed concept, in place.
 pub fn enrich_all(
     result: &mut PlacementResult,
     all_chunks: &[Chunk],
@@ -175,8 +175,8 @@ pub fn enrich_all(
     let chunk_indices_by_term: HashMap<&str, &[usize]> =
         all_terms.iter().map(|t| (t.term.as_str(), t.chunk_indices.as_slice())).collect();
 
-    let total = result.root.len() + result.periphery.values().map(|v| v.len()).sum::<usize>();
-    let all_concepts = result.root.iter_mut().chain(result.periphery.values_mut().flatten());
+    let total = result.total_concepts();
+    let all_concepts = result.shards.values_mut().flatten();
 
     for (i, concept) in all_concepts.enumerate() {
         let indices = chunk_indices_by_term.get(concept.raw_term.as_str()).copied().unwrap_or(&[]);
@@ -184,15 +184,12 @@ pub fn enrich_all(
         print_progress(i + 1, total);
     }
     if total > 0 {
-        println!(); // move past the progress line once the batch finishes
+        println!();
     }
 
     Ok(())
 }
 
-/// Bare carriage-return progress bar -- no new dependency for something
-/// this simple. Overwrites the same terminal line each call; negligible
-/// cost next to the Ollama round trip each iteration is already waiting on.
 fn print_progress(current: usize, total: usize) {
     let width = 30;
     let ratio = current as f64 / total.max(1) as f64;
@@ -205,14 +202,12 @@ fn print_progress(current: usize, total: usize) {
 
 // ── Stage 5: persistence ──────────────────────────────────────────────────────
 
-/// Writes every shard to disk, plus the registry snapshot needed to
-/// resume routing into the same periphery shards next run.
+/// Writes every shard to disk as shard-N.km, plus registry.km.
+/// No shard is special — shard-0 is written the same way as shard-22.
 pub fn write_all(result: &PlacementResult, registry: &ShardRegistry, config: &PipelineConfig) -> Result<(), PipelineError> {
     std::fs::create_dir_all(&config.output_dir)?;
 
-    km::write_shard(&result.root, "root", &config.output_dir.join("root.km"))?;
-
-    for (shard_id, concepts) in &result.periphery {
+    for (shard_id, concepts) in &result.shards {
         let path = config.output_dir.join(format!("{shard_id}.km"));
         km::write_shard(concepts, shard_id, &path)?;
     }
@@ -224,14 +219,6 @@ pub fn write_all(result: &PlacementResult, registry: &ShardRegistry, config: &Pi
 
 // ── Full run ──────────────────────────────────────────────────────────────────
 
-/// Runs every stage end to end: ingest -> extract -> score -> embed ->
-/// place -> enrich -> write. The only function in this file that touches
-/// a live Ollama for both embedding and enrichment, so it's genuinely
-/// outside cargo test's reach -- validating it works means running it
-/// against a real corpus, not a unit test. Every stage it calls into has
-/// already been tested on its own, pure-logic terms; this is just the
-/// wiring, timed per stage since enrichment (the ~120 Ollama calls) was
-/// always expected to dominate wall-clock time, not NER or chunking.
 pub fn run(source_paths: &[PathBuf], config: &PipelineConfig) -> Result<(), PipelineError> {
     let t0 = Instant::now();
     let (chunks, scores) = ingest_and_score(source_paths, config)?;
@@ -247,10 +234,10 @@ pub fn run(source_paths: &[PathBuf], config: &PipelineConfig) -> Result<(), Pipe
     let mut registry = ShardRegistry::new();
     let mut result = place_corpus(&scores, &embeddings, &config.placement, &mut registry);
     println!(
-        "place: {:?} ({} root, {} periphery shards)",
+        "place: {:?} ({} concepts, {} shards)",
         t2.elapsed(),
-        result.root.len(),
-        result.periphery.len()
+        result.total_concepts(),
+        result.shard_count(),
     );
 
     let t3 = Instant::now();
@@ -267,13 +254,7 @@ pub fn run(source_paths: &[PathBuf], config: &PipelineConfig) -> Result<(), Pipe
 }
 
 /// For each candidate threshold, how many terms would survive at that
-/// strength_threshold. No placement, no Ollama -- just the scoring math,
-/// so it's near-instant and safe to run before committing to a full
-/// pipeline run. Built directly off the first real run putting 1747
-/// terms through enrichment from a single 64KB file: strength_threshold
-/// was always flagged as an unverified guess (0.001, far more permissive
-/// than Python's min_tf=10 ever was), and this is what finally gives a
-/// real, corpus-specific number to react to instead of guessing again.
+/// strength_threshold. No placement, no Ollama -- just the scoring math.
 pub fn threshold_survival_counts(scores: &[ScoredTerm], thresholds: &[f64]) -> Vec<(f64, usize)> {
     let strengths = tfidf::normalize_to_strength(scores);
     thresholds.iter().map(|&t| (t, strengths.values().filter(|&&s| s >= t).count())).collect()
@@ -300,15 +281,7 @@ mod tests {
         .unwrap();
 
         let config = PipelineConfig {
-            ingest: IngestConfig {
-                chunk_size: 50,
-                overlap: 5,
-            },
-            // Permissive on purpose -- this test checks that chunking
-            // wires through to scoring correctly, not whether a small
-            // hand-written fixture happens to hit a realistic
-            // min_occurrences. The default (10) is tuned for real
-            // corpora, not test prose.
+            ingest: IngestConfig { chunk_size: 50, overlap: 5 },
             tfidf: TfidfConfig { min_occurrences: 1 },
             ..Default::default()
         };
@@ -339,21 +312,13 @@ mod tests {
         .unwrap();
 
         let config = PipelineConfig {
-            ingest: IngestConfig {
-                chunk_size: 50,
-                overlap: 5,
-            },
-            // Same reasoning as the ingest test above -- this checks
-            // wiring, not whether the production min_occurrences default
-            // happens to suit a two-sentence fixture.
+            ingest: IngestConfig { chunk_size: 50, overlap: 5 },
             tfidf: TfidfConfig { min_occurrences: 1 },
             ..Default::default()
         };
 
         let (_chunks, scores) = ingest_and_score(&[path.clone()], &config).unwrap();
 
-        // Stand-in embeddings -- no live Ollama involved, just confirming
-        // the wiring from scores through placement actually works.
         let embeddings: HashMap<String, Vec<f64>> = scores
             .iter()
             .enumerate()
@@ -363,9 +328,8 @@ mod tests {
         let mut registry = ShardRegistry::new();
         let result = place_corpus(&scores, &embeddings, &config.placement, &mut registry);
 
-        let total_placed = result.root.len() + result.periphery.values().map(|v| v.len()).sum::<usize>();
-        assert!(total_placed > 0);
-        assert_eq!(total_placed, scores.len(), "every scored term had an embedding, so none should be skipped");
+        assert!(result.total_concepts() > 0);
+        assert_eq!(result.total_concepts(), scores.len(), "every scored term had an embedding, so none should be skipped");
 
         std::fs::remove_file(path).ok();
     }
@@ -379,13 +343,12 @@ mod tests {
             source_path: PathBuf::from("t.txt"),
             source_line: None,
         }];
-        let embeddings = HashMap::new(); // deliberately empty
+        let embeddings = HashMap::new();
 
         let mut registry = ShardRegistry::new();
         let result = place_corpus(&scores, &embeddings, &PlacementConfig::default(), &mut registry);
 
-        let total_placed = result.root.len() + result.periphery.values().map(|v| v.len()).sum::<usize>();
-        assert_eq!(total_placed, 0);
+        assert_eq!(result.total_concepts(), 0);
     }
 
     #[test]
@@ -409,13 +372,13 @@ mod tests {
 
         let counts = threshold_survival_counts(&scores, &[0.001, 0.5, 0.99]);
 
-        assert_eq!(counts[0].1, 2, "near-zero threshold should keep both terms");
-        assert!(counts[2].1 <= counts[0].1, "higher threshold should never keep more terms");
-        assert!(counts[2].1 >= 1, "the single strongest term should survive even a near-max threshold");
+        assert_eq!(counts[0].1, 2);
+        assert!(counts[2].1 <= counts[0].1);
+        assert!(counts[2].1 >= 1);
     }
 
     #[test]
-    fn test_write_all_produces_root_and_registry_files() {
+    fn test_write_all_produces_shard_and_registry_files() {
         let dir = std::env::temp_dir().join(format!("pilar_test_write_all_{}", std::process::id()));
 
         let scores = vec![ScoredTerm {
@@ -438,7 +401,8 @@ mod tests {
 
         write_all(&result, &registry, &config).unwrap();
 
-        assert!(dir.join("root.km").exists());
+        // manifold should land in shard-0 (near origin, within shard_radius)
+        assert!(dir.join("shard-0.km").exists());
         assert!(dir.join("registry.km").exists());
 
         std::fs::remove_dir_all(dir).ok();

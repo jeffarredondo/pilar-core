@@ -234,4 +234,17 @@ json, for Ollama HTTP calls), `serde` + `serde_json` (round-tripping
 `main.rs` adds no new dependencies — just `std`.
 
 ## usage
-`cargo run --release -- /Users/pocoloco/Documents/pilar-core/docs/brandenburg.txt --output ./km_output`
+```bash
+# single corpus
+cargo run --release -- /Users/pocoloco/Documents/pilar-core/docs/brandenburg.txt --output ./km_output
+cargo run --release -- /Users/pocoloco/Documents/pilar-core/docs/spacex_s1.txt --output ./km_output
+
+# multi-run 
+cargo run --release -- \
+  /Users/pocoloco/Documents/pilar-core/docs/spacex_s1.txt \
+  /Users/pocoloco/Documents/pilar-core/docs/mackay.txt \
+  /Users/pocoloco/Documents/pilar-core/docs/brandenburg.txt \
+  --output ./km_output \
+  --dry-run
+
+```

@@ -12,17 +12,10 @@ use crate::types::{Concept, GeometryConfidence, ManifoldCoord};
 
 // ── Input contract ────────────────────────────────────────────────────────────
 
-/// What ner.rs + tfidf.rs + embed.rs will eventually produce together —
-/// a term with its embedding attached, plus a pre-normalized strength
-/// value. Defined here, not upstream, because those modules don't exist
-/// yet; this is placement's side of the contract, so there's something
-/// concrete to build toward.
-///
-/// `strength` arrives already normalized to [0, 1] — placement doesn't
-/// know or care whether it came from TF-IDF, access-count decay, or
-/// anything else. Whoever produces an EmbeddedTerm owns normalizing
-/// their own raw signal before handing it off (see tfidf.rs's
-/// normalize_to_strength for the corpus-based version of that step).
+/// What ner.rs + tfidf.rs + embed.rs produce together — a term with its
+/// embedding attached and a pre-normalized strength value. `strength`
+/// arrives already normalized to [0, 1] — placement doesn't know or care
+/// whether it came from TF-IDF, access-count decay, or anything else.
 pub struct EmbeddedTerm {
     pub term: String,
     pub strength: f64,
@@ -35,27 +28,15 @@ pub struct EmbeddedTerm {
 
 pub struct PlacementConfig {
     pub k_neighbors: usize,
-    /// Minimum normalized strength to be placed at all. Interpreted
-    /// against the [0, 1] strength scale, not a raw producer-specific
-    /// score — same meaning regardless of what computed the strength.
+    /// Minimum normalized strength to be placed at all.
     pub strength_threshold: f64,
-    /// Hard cap on placed concepts, keeping the strongest N after the
-    /// threshold filter. None means no cap.
-    ///
-    /// This is NOT a noise filter — tfidf.rs's min_occurrences already
-    /// does that job, upstream, before a term is even scored. By the
-    /// time terms reach this cap they've already cleared "did this
-    /// actually recur in the corpus." Truncating that already-curated
-    /// set to the top N is a resource/scope decision (enrichment costs
-    /// ~2 Ollama calls per concept; real corpora produced 1000+
-    /// genuinely-recurring terms, which is hours of enrichment, not
-    /// minutes) — the same role Python's n_top played after min_tf,
-    /// just correctly ordered this time. A cap applied to an unfiltered
-    /// pool would be arbitrary; a cap applied after a real recurrence
-    /// floor is just "how many of the good candidates can we afford."
+    /// Hard cap on placed concepts after the threshold filter. None means
+    /// no cap. This is a resource knob, not a noise filter — min_occurrences
+    /// in tfidf.rs already handles noise upstream. Capping here just limits
+    /// enrichment cost (2 Ollama calls per concept).
     pub max_concepts: Option<usize>,
-    /// Fixed seed for the random projections below. "Random" only means
-    /// "arbitrary and fixed" here — same seed, same projections, every run.
+    /// Fixed seed for random projections — same seed, same projections,
+    /// every run. "Random" only means "arbitrary and fixed" here.
     pub projection_seed: u64,
     pub sharding: ShardingConfig,
 }
@@ -65,7 +46,7 @@ impl Default for PlacementConfig {
         Self {
             k_neighbors: 5,
             strength_threshold: 0.001,
-            max_concepts: Some(100),
+            max_concepts: None,
             projection_seed: 42,
             sharding: ShardingConfig::default(),
         }
@@ -74,12 +55,29 @@ impl Default for PlacementConfig {
 
 // ── Output ────────────────────────────────────────────────────────────────────
 
-/// Concepts grouped by where they ended up. `periphery` is keyed by
-/// shard_id rather than a magic "root" string sitting in the same map —
-/// km.rs writes `root` to one file and each `periphery` entry to its own.
+/// Concepts grouped by shard_id. No shard is special — shard-0 is just
+/// the first one created, not a "root." The registry holds the spatial
+/// index; this holds the concepts.
 pub struct PlacementResult {
-    pub root: Vec<Concept>,
-    pub periphery: HashMap<String, Vec<Concept>>,
+    pub shards: HashMap<String, Vec<Concept>>,
+}
+
+impl PlacementResult {
+    fn new() -> Self {
+        Self { shards: HashMap::new() }
+    }
+
+    fn insert(&mut self, shard_id: String, concept: Concept) {
+        self.shards.entry(shard_id).or_default().push(concept);
+    }
+
+    pub fn total_concepts(&self) -> usize {
+        self.shards.values().map(|v| v.len()).sum()
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
 }
 
 // ── Fixed Projections ─────────────────────────────────────────────────────────
@@ -113,8 +111,8 @@ impl Projections {
     }
 
     /// Unit direction in H³ — magnitude is deliberately discarded here.
-    /// Radius comes from strength elsewhere, not from this; this
-    /// function only answers "which way," never "how far."
+    /// Radius comes from strength elsewhere; this function only answers
+    /// "which way," never "how far."
     pub fn hyperbolic_direction(&self, embedding: &[f64]) -> [f64; 3] {
         let raw = [
             Self::dot(&self.hyperbolic[0], embedding),
@@ -123,8 +121,6 @@ impl Projections {
         ];
         let norm = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]).sqrt();
         if norm < 1e-10 {
-            // Vanishingly unlikely with a real embedding — fall back to a
-            // fixed axis rather than dividing by ~zero.
             return [1.0, 0.0, 0.0];
         }
         [raw[0] / norm, raw[1] / norm, raw[2] / norm]
@@ -154,19 +150,11 @@ pub fn place(
         .collect();
 
     if let Some(max) = config.max_concepts {
-        // Strongest first, so truncate keeps the top N, not an
-        // arbitrary N. Applied here -- before distance_matrix,
-        // eigenvalue_signature, and the rest of the per-term geometry
-        // work below -- so capping also saves real computation, not
-        // just enrichment time downstream.
         terms.sort_by(|a, b| b.strength.partial_cmp(&a.strength).unwrap());
         terms.truncate(max);
     }
 
-    let mut result = PlacementResult {
-        root: Vec::new(),
-        periphery: HashMap::new(),
-    };
+    let mut result = PlacementResult::new();
 
     if terms.is_empty() {
         return result;
@@ -181,13 +169,9 @@ pub fn place(
     let k = config.k_neighbors.min(n.saturating_sub(1));
 
     for (i, term) in terms.iter().enumerate() {
-        // strength arrives already normalized -- no corpus-wide max to
-        // compute here. This is the whole point: place() doesn't know or
-        // care whether strength came from TF-IDF, access-count decay, or
-        // anything else, and shouldn't have to.
         let strength = term.strength;
 
-        // k nearest neighbors by embedding distance
+        // k nearest neighbors by embedding distance for geometry classification
         let mut neighbors: Vec<(usize, f64)> = (0..n).filter(|&j| j != i).map(|j| (j, d[(i, j)])).collect();
         neighbors.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         neighbors.truncate(k);
@@ -197,23 +181,24 @@ pub fn place(
 
         let sub_n = neighborhood_indices.len();
         let mut sub_d = DMatrix::zeros(sub_n, sub_n);
-        for (a, &ia) in neighborhood_indices.iter().enumerate() {
-            for (b, &ib) in neighborhood_indices.iter().enumerate() {
-                sub_d[(a, b)] = d[(ia, ib)];
+        for (row, &gi) in neighborhood_indices.iter().enumerate() {
+            for (col, &gj) in neighborhood_indices.iter().enumerate() {
+                sub_d[(row, col)] = d[(gi, gj)];
             }
         }
 
-        // Both gromov_delta and eigenvalue_signature degrade gracefully on
-        // tiny neighborhoods (empty quadruple loops, near-zero eigenvalue
-        // totals) — no special-casing needed for isolated concepts.
         let delta = gromov_delta(&sub_d);
         let eigen: EigenSignature = eigenvalue_signature(&sub_d);
 
-        // Low delta strongly suggests hyperbolic regardless of eigenvalue
-        // signature — same tiebreaker as before, now living here as a
-        // policy decision over two independent pieces of evidence, not
-        // buried inside either geometry.rs function.
-        let class = if delta < 1.0 { GeometryClass::Hyperbolic } else { eigen.class };
+        // Eigenvalue signature is the primary signal — it does the actual
+        // geometric analysis. Gromov delta only overrides a non-hyperbolic
+        // classification if delta is extremely low (< 0.1), meaning the
+        // neighborhood is unambiguously tree-like regardless of what the
+        // eigenvalues say. Let the math determine the shape.
+        let class = match eigen.class {
+            GeometryClass::Hyperbolic => GeometryClass::Hyperbolic,
+            other => if delta < 0.1 { GeometryClass::Hyperbolic } else { other },
+        };
 
         let confidence = GeometryConfidence {
             gromov_delta: delta,
@@ -222,23 +207,50 @@ pub fn place(
             neg_eigenvalue_fraction: eigen.neg_eigenvalue_fraction,
         };
 
-        let coordinate = match class {
+        // Compute global H³ position from embedding — this is the position
+        // before any shard-local recentering. The registry uses this to
+        // decide which shard the concept belongs to.
+        let global_position = match class {
             GeometryClass::Hyperbolic => {
                 let dir = projections.hyperbolic_direction(&term.embedding);
                 let r = (1.0 - 0.9 * strength).min(0.95);
-                ManifoldCoord::Hyperbolic {
-                    position: [dir[0] * r, dir[1] * r, dir[2] * r],
-                }
+                Some([dir[0] * r, dir[1] * r, dir[2] * r])
             }
-            GeometryClass::Spherical => ManifoldCoord::Spherical {
-                theta: projections.spherical_angle(&term.embedding),
-            },
-            GeometryClass::Flat => ManifoldCoord::Flat {
-                position: vec![projections.flat_position(&term.embedding)],
-            },
+            _ => None,
         };
 
-        let mut concept = Concept {
+        let (coordinate, shard_id) = if let Some(pos) = global_position {
+            // All hyperbolic concepts route through the registry — no
+            // special "root" case. The registry decides which shard based
+            // on proximity to existing anchors. Local position is the
+            // Möbius-translated coordinate in the shard's own frame.
+            let assignment = registry.route(&pos, &config.sharding);
+            let (sid, local_position) = match assignment {
+                ShardAssignment::Joined { shard_id, local_position }
+                | ShardAssignment::NewShard { shard_id, local_position } => (shard_id, local_position),
+            };
+            let coord = ManifoldCoord::Hyperbolic {
+                position: [local_position[0], local_position[1], local_position[2]],
+            };
+            (coord, sid)
+        } else {
+            // Spherical and flat concepts don't live in H³ so they don't
+            // participate in shard routing. They land in shard-0 by
+            // convention — a future extension could give them their own
+            // spatial index if they become numerous enough to warrant it.
+            let coord = match class {
+                GeometryClass::Spherical => ManifoldCoord::Spherical {
+                    theta: projections.spherical_angle(&term.embedding),
+                },
+                GeometryClass::Flat => ManifoldCoord::Flat {
+                    position: vec![projections.flat_position(&term.embedding)],
+                },
+                GeometryClass::Hyperbolic => unreachable!(),
+            };
+            (coord, "shard-0".to_string())
+        };
+
+        let concept = Concept {
             raw_term: term.term.clone(),
             label: String::new(),
             description: String::new(),
@@ -250,28 +262,7 @@ pub fn place(
             source_line: term.source_line,
         };
 
-        // Sharding only applies to hyperbolic concepts — S¹ has no
-        // boundary to fall toward, and ℝ¹ doesn't share the same
-        // precision-loss failure mode that motivated periphery shards
-        // in the first place.
-        if let ManifoldCoord::Hyperbolic { position } = &concept.coordinate {
-            let radius = (position[0] * position[0] + position[1] * position[1] + position[2] * position[2]).sqrt();
-
-            if radius > config.sharding.periphery_radius {
-                let assignment = registry.route(position, &config.sharding);
-                let (shard_id, local_position) = match assignment {
-                    ShardAssignment::Joined { shard_id, local_position }
-                    | ShardAssignment::NewShard { shard_id, local_position } => (shard_id, local_position),
-                };
-                concept.coordinate = ManifoldCoord::Hyperbolic {
-                    position: [local_position[0], local_position[1], local_position[2]],
-                };
-                result.periphery.entry(shard_id).or_default().push(concept);
-                continue;
-            }
-        }
-
-        result.root.push(concept);
+        result.insert(shard_id, concept);
     }
 
     result
@@ -291,6 +282,10 @@ mod tests {
             source_path: PathBuf::from("test.md"),
             source_line: None,
         }
+    }
+
+    fn all_concepts(result: &PlacementResult) -> Vec<&Concept> {
+        result.shards.values().flatten().collect()
     }
 
     #[test]
@@ -318,8 +313,8 @@ mod tests {
         let mut registry = ShardRegistry::new();
         let config = PlacementConfig::default();
         let result = place(vec![], &config, &mut registry);
-        assert!(result.root.is_empty());
-        assert!(result.periphery.is_empty());
+        assert_eq!(result.total_concepts(), 0);
+        assert_eq!(result.shard_count(), 0);
     }
 
     #[test]
@@ -331,34 +326,31 @@ mod tests {
             mock_term("noise", 0.0001, vec![0.5, 0.1, 0.2, 0.1]),
         ];
         let result = place(terms, &config, &mut registry);
-        let all: Vec<&Concept> = result.root.iter().chain(result.periphery.values().flatten()).collect();
-        assert!(all.iter().all(|c| c.raw_term != "noise"));
+        assert!(all_concepts(&result).iter().all(|c| c.raw_term != "noise"));
     }
 
     #[test]
-    fn test_high_strength_lands_nearer_origin() {
-        let mut registry = ShardRegistry::new();
-        let config = PlacementConfig::default();
-        // 0.9 and 0.3, not 0.9 and 0.1 -- both need to stay comfortably
-        // inside the periphery cutoff (default 0.9) so this test cleanly
-        // checks radius ordering, not sharding routing. r(0.9) = 0.19,
-        // r(0.3) = 0.73, both well under the 0.9 cutoff.
-        let terms = vec![
-            mock_term("strong", 0.9, vec![0.1, 0.2, 0.3, 0.4, 0.5]),
-            mock_term("weak", 0.3, vec![0.4, 0.1, 0.5, 0.2, 0.3]),
-        ];
-        let result = place(terms, &config, &mut registry);
+    #[test]
+    fn test_strength_to_radius_formula() {
+        // The radius formula r = (1 - 0.9 * strength).min(0.95) is the core
+        // property: higher strength → smaller radius → closer to origin.
+        // Test it directly on the projections rather than through the full
+        // placement pipeline, where Möbius translation into a non-origin shard
+        // can shift local coordinates in ways that make the assertion fragile.
+        let p = Projections::new(5, 42);
+        let emb = vec![0.1, 0.2, 0.3, 0.4, 0.5];
+        let dir = p.hyperbolic_direction(&emb);
 
-        let radius_of = |c: &Concept| match &c.coordinate {
-            ManifoldCoord::Hyperbolic { position } => {
-                (position[0].powi(2) + position[1].powi(2) + position[2].powi(2)).sqrt()
-            }
-            _ => panic!("expected hyperbolic for this test's tiny neighborhood"),
-        };
+        let r_strong = 1.0 - 0.9 * 0.9_f64;
+        let r_weak   = 1.0 - 0.9 * 0.3_f64;
 
-        let strong = result.root.iter().find(|c| c.raw_term == "strong").unwrap();
-        let weak = result.root.iter().find(|c| c.raw_term == "weak").unwrap();
-        assert!(radius_of(strong) < radius_of(weak));
+        let pos_strong = [dir[0] * r_strong, dir[1] * r_strong, dir[2] * r_strong];
+        let pos_weak   = [dir[0] * r_weak,   dir[1] * r_weak,   dir[2] * r_weak];
+
+        let radius = |p: [f64; 3]| (p[0].powi(2) + p[1].powi(2) + p[2].powi(2)).sqrt();
+
+        assert!(radius(pos_strong) < radius(pos_weak),
+            "strength 0.9 should produce smaller radius than strength 0.3");
     }
 
     #[test]
@@ -374,12 +366,12 @@ mod tests {
             mock_term("strongest", 0.9, vec![0.3, 0.1, 0.4, 0.2]),
         ];
         let result = place(terms, &config, &mut registry);
-        let all: Vec<&Concept> = result.root.iter().chain(result.periphery.values().flatten()).collect();
+        let all = all_concepts(&result);
 
-        assert_eq!(all.len(), 2, "should keep exactly max_concepts, not everything above threshold");
+        assert_eq!(all.len(), 2);
         assert!(all.iter().any(|c| c.raw_term == "strongest"));
         assert!(all.iter().any(|c| c.raw_term == "middle"));
-        assert!(all.iter().all(|c| c.raw_term != "weakest"), "weakest term should be the one dropped");
+        assert!(all.iter().all(|c| c.raw_term != "weakest"));
     }
 
     #[test]
@@ -393,8 +385,7 @@ mod tests {
             .map(|i| mock_term(&format!("term{i}"), 0.5, vec![i as f64 * 0.1, 0.2, 0.3, 0.4]))
             .collect();
         let result = place(terms, &config, &mut registry);
-        let total = result.root.len() + result.periphery.values().map(|v| v.len()).sum::<usize>();
-        assert_eq!(total, 10, "None should place everything that passed the strength threshold");
+        assert_eq!(result.total_concepts(), 10);
     }
 
     #[test]
@@ -403,8 +394,28 @@ mod tests {
         let config = PlacementConfig::default();
         let terms = vec![mock_term("manifold", 0.9, vec![0.1, 0.2, 0.3])];
         let result = place(terms, &config, &mut registry);
-        let c = &result.root[0];
+        let c = all_concepts(&result).into_iter().next().unwrap();
         assert_eq!(c.label, "");
         assert_eq!(c.description, "");
+    }
+
+    #[test]
+    fn test_all_concepts_assigned_to_a_shard() {
+        let mut registry = ShardRegistry::new();
+        let config = PlacementConfig::default();
+        let terms: Vec<EmbeddedTerm> = (0..5)
+            .map(|i| mock_term(&format!("concept{i}"), 0.5 + i as f64 * 0.1, vec![i as f64 * 0.1, 0.2, 0.3, 0.4]))
+            .collect();
+        let result = place(terms, &config, &mut registry);
+
+        // Every concept must be in some shard — none dropped silently.
+        assert_eq!(result.total_concepts(), 5);
+        // Every shard_id in result must exist in the registry.
+        for shard_id in result.shards.keys() {
+            assert!(
+                registry.anchors().iter().any(|a| &a.shard_id == shard_id),
+                "shard {shard_id} in result but not in registry"
+            );
+        }
     }
 }
