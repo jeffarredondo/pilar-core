@@ -10,6 +10,8 @@ use crate::geometry::{distance_matrix, eigenvalue_signature, gromov_delta, Eigen
 use crate::sharding::{ShardAssignment, ShardRegistry, ShardingConfig};
 use crate::types::{Concept, GeometryConfidence, ManifoldCoord};
 
+use serde::Deserialize;
+
 // ── Input contract ────────────────────────────────────────────────────────────
 
 /// What ner.rs + tfidf.rs + embed.rs produce together — a term with its
@@ -26,6 +28,7 @@ pub struct EmbeddedTerm {
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+#[derive(Deserialize)] 
 pub struct PlacementConfig {
     pub k_neighbors: usize,
     /// Minimum normalized strength to be placed at all.

@@ -7,6 +7,7 @@ use crate::types::{Chunk, Concept};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+#[derive(Deserialize)]
 pub struct EnrichConfig {
     pub base_url: String,
     /// Fast, heavily-guardrailed extractive model. Matches a narrow task

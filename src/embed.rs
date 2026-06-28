@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+#[derive(Deserialize)] 
 pub struct EmbedConfig {
     pub base_url: String,
     pub model: String,

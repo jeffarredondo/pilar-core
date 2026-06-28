@@ -1,9 +1,10 @@
 use std::path::Path;
-
 use crate::types::Chunk;
+use serde::Deserialize;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+#[derive(Deserialize)]
 pub struct IngestConfig {
     pub chunk_size: usize,
     pub overlap: usize,

@@ -1,0 +1,28 @@
+output_dir = "./km_output"
+max_concepts_per_source = 100
+
+[ingest]
+chunk_size = 2000
+overlap = 200
+
+[tfidf]
+min_occurrences = 10
+
+[embed]
+base_url = "http://localhost:11434"
+model = "nomic-embed-text"
+
+[placement]
+k_neighbors = 5
+strength_threshold = 0.001
+projection_seed = 42
+
+[enrich]
+base_url = "http://localhost:11434"
+summarize_model = "tinyllama"
+name_model = "mistral"
+max_chunks = 5
+signal_threshold = 0.5
+
+[placement.sharding]
+shard_radius = 0.9

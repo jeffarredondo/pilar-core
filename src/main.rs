@@ -55,10 +55,23 @@ fn main() -> ExitCode {
     println!("  output: {}", output_dir.display());
     println!();
 
-    let config = PipelineConfig {
-        output_dir,
-        ..Default::default()
+    // Load config from pilar.toml if present, fall back to default
+    let config = if std::path::Path::new("pilar.toml").exists() {
+        match pipeline::PipelineConfig::from_file(std::path::Path::new("pilar.toml")) {
+            Ok(c) => {
+                println!("  config: pilar.toml");
+                // output_dir from CLI overrides config file
+                pipeline::PipelineConfig { output_dir, ..c }
+            }
+            Err(e) => {
+                eprintln!("warning: failed to load pilar.toml ({e}), using defaults");
+                pipeline::PipelineConfig { output_dir, ..Default::default() }
+            }
+        }
+    } else {
+        pipeline::PipelineConfig { output_dir, ..Default::default() }
     };
+
 
     match pipeline::run(&source_paths, &config) {
         Ok(()) => {

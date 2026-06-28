@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-
+use serde::Deserialize;
 use crate::types::Chunk;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+#[derive(Deserialize)] 
 pub struct TfidfConfig {
     /// Minimum total occurrences across the whole corpus for a term to
     /// be scored at all. Ported from Python's min_tf=10. A term

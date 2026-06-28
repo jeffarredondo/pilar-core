@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
+use std::path::Path;
 
 use crate::embed::{self, EmbedConfig, EmbedError};
 use crate::enrich::{self, EnrichConfig, EnrichError};
@@ -13,8 +14,11 @@ use crate::sharding::ShardRegistry;
 use crate::tfidf::{self, ScoredTerm, TfidfConfig};
 use crate::types::Chunk;
 
+use serde::Deserialize;
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
+#[derive(Deserialize)] 
 pub struct PipelineConfig {
     pub ingest: IngestConfig,
     pub tfidf: TfidfConfig,
@@ -42,6 +46,19 @@ impl Default for PipelineConfig {
     }
 }
 
+impl PipelineConfig {
+    /// Loads config from a TOML file, falling back to Default for any
+    /// fields not present. This means a minimal pilar.toml only needs
+    /// to override what differs from the defaults — the server can ship
+    /// a production pilar.toml that only sets base_url and model names.
+    pub fn from_file(path: &Path) -> Result<Self, PipelineError> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| PipelineError::Io(e))?;
+        toml::from_str(&content)
+            .map_err(|e| PipelineError::Config(e.to_string()))
+    }
+}
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -50,6 +67,7 @@ pub enum PipelineError {
     Embed(EmbedError),
     Enrich(EnrichError),
     Km(KmError),
+    Config(String),
 }
 
 impl std::fmt::Display for PipelineError {
@@ -59,6 +77,7 @@ impl std::fmt::Display for PipelineError {
             PipelineError::Embed(e) => write!(f, "embedding error: {e}"),
             PipelineError::Enrich(e) => write!(f, "enrichment error: {e}"),
             PipelineError::Km(e) => write!(f, "storage error: {e}"),
+            PipelineError::Config(msg) => write!(f, "config error: {msg}"),
         }
     }
 }

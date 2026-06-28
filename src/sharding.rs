@@ -9,6 +9,7 @@ use crate::geometry::{poincare_distance, translate_to_origin};
 /// that shard rather than spawning a new one. This is a file-size and
 /// query-locality knob, not a geometry knob — constant curvature space
 /// has no privileged radius.
+#[derive(Deserialize)] 
 pub struct ShardingConfig {
     pub shard_radius: f64,
 }
