@@ -126,6 +126,8 @@ impl Projections {
         if norm < 1e-10 {
             return [1.0, 0.0, 0.0];
         }
+        
+        //let scale = 0.5; // interior of the ball, no fixed "strength"
         [raw[0] / norm, raw[1] / norm, raw[2] / norm]
     }
 
@@ -193,15 +195,14 @@ pub fn place(
         let delta = gromov_delta(&sub_d);
         let eigen: EigenSignature = eigenvalue_signature(&sub_d);
 
-        // Eigenvalue signature is the primary signal — it does the actual
-        // geometric analysis. Gromov delta only overrides a non-hyperbolic
-        // classification if delta is extremely low (< 0.1), meaning the
-        // neighborhood is unambiguously tree-like regardless of what the
-        // eigenvalues say. Let the math determine the shape.
-        let class = match eigen.class {
-            GeometryClass::Hyperbolic => GeometryClass::Hyperbolic,
-            other => if delta < 0.1 { GeometryClass::Hyperbolic } else { other },
-        };
+        // Everything lives in H³. Ambiguous concepts (high delta) get pushed
+        // toward the boundary rather than routed to a different geometry.
+        // S¹ and ℝ¹ are not supported — the data doesn't justify them yet.
+        let class = GeometryClass::Hyperbolic;
+
+        // Use delta as a radius modifier — ambiguous neighborhoods land
+        // at higher radius (more peripheral) than confident hyperbolic ones.
+        let radius_penalty = if delta >= 0.15 { 0.1 } else { 0.0 };
 
         let confidence = GeometryConfidence {
             gromov_delta: delta,
@@ -216,7 +217,7 @@ pub fn place(
         let global_position = match class {
             GeometryClass::Hyperbolic => {
                 let dir = projections.hyperbolic_direction(&term.embedding);
-                let r = (1.0 - 0.9 * strength).min(0.95);
+                let r = (1.0 - 0.9 * strength + radius_penalty).min(0.95);
                 Some([dir[0] * r, dir[1] * r, dir[2] * r])
             }
             _ => None,

@@ -19,7 +19,7 @@ projection_seed = 42
 
 [enrich]
 base_url = "http://localhost:11434"
-summarize_model = "tinyllama"
+summarize_model = "mistral"
 name_model = "mistral"
 max_chunks = 5
 signal_threshold = 0.5

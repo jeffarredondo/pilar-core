@@ -88,12 +88,16 @@ pub fn read_shard(path: &Path) -> Result<Shard, KmError> {
 pub struct RegistrySnapshot {
     pub anchors: Vec<ShardAnchor>,
     pub next_id: usize,
+    pub projection_seed: u64,
+    pub embedding_dim: usize,
 }
 
-pub fn write_registry(registry: &ShardRegistry, path: &Path) -> Result<(), KmError> {
+pub fn write_registry(registry: &ShardRegistry, path: &Path, projection_seed: u64, embedding_dim: usize) -> Result<(), KmError> {
     let snapshot = RegistrySnapshot {
         anchors: registry.anchors().to_vec(),
         next_id: registry.next_id(),
+        projection_seed,
+        embedding_dim,
     };
     let toml_str = toml::to_string_pretty(&snapshot)?;
     std::fs::write(path, toml_str)?;
@@ -214,7 +218,7 @@ mod tests {
         registry.route(&[0.92, 0.0, 0.0], &config);   // shard-1
         registry.route(&[-0.92, 0.0, 0.0], &config);  // shard-2
 
-        write_registry(&registry, &path).unwrap();
+        write_registry(&registry, &path, 42, 768).unwrap();
         let mut loaded = read_registry(&path).unwrap();
 
         assert_eq!(loaded.anchor_count(), 3); // shard-0, shard-1, shard-2

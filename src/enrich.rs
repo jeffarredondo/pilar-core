@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::tfidf::ScoredTerm;
 use crate::types::{Chunk, Concept};
 
+use std::path::Path;
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -87,7 +89,7 @@ struct ChatResponse {
     message: ChatResponseMessage,
 }
 
-fn chat(prompt: &str, model: &str, config: &EnrichConfig) -> Result<String, EnrichError> {
+pub fn chat(prompt: &str, model: &str, config: &EnrichConfig) -> Result<String, EnrichError> {
     let client = reqwest::blocking::Client::new();
     let url = format!("{}/api/chat", config.base_url);
 
@@ -134,17 +136,20 @@ fn rank_chunks_by_signal_density<'a>(
         .map(|t| t.term.as_str())
         .collect();
 
-    let mut scored: Vec<(usize, &Chunk)> = concept_chunk_indices
+    let mut scored: Vec<(f64, &Chunk)> = concept_chunk_indices
         .iter()
         .map(|&idx| {
             let chunk = &all_chunks[idx];
             let chunk_lower = chunk.text.to_lowercase();
-            let signal_count = high_value_terms.iter().filter(|term| chunk_lower.contains(**term)).count();
-            (signal_count, chunk)
+            let signal_score: f64 = high_value_terms.iter()
+                .filter(|term| chunk_lower.contains(**term))
+                .map(|term| strengths.get(*term).copied().unwrap_or(0.0))
+                .sum();
+            (signal_score, chunk)
         })
         .collect();
 
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
     scored.into_iter().map(|(_, c)| c).collect()
 }
 
@@ -171,15 +176,31 @@ One sentence description of \"{raw_term}\" based only on the text above:"
 /// crazy" small model has little room to wander.
 pub fn summarize_concept(
     raw_term: &str,
+    source_path: &Path,
     concept_chunk_indices: &[usize],
     all_chunks: &[Chunk],
     all_terms: &[ScoredTerm],
     strengths: &HashMap<String, f64>,
     config: &EnrichConfig,
 ) -> Result<String, EnrichError> {
-    let ranked = rank_chunks_by_signal_density(concept_chunk_indices, all_chunks, all_terms, strengths, config.signal_threshold);
+    // Only rank using terms from the same source — prevents cross-corpus
+    // signal bleed where SpaceX terms dominate Mackay chunk ranking
+    let source_terms: Vec<ScoredTerm> = all_terms
+        .iter()
+        .filter(|t| t.source_path == source_path)
+        .cloned()
+        .collect();
+
+    let ranked = rank_chunks_by_signal_density(concept_chunk_indices, all_chunks, &source_terms, strengths, config.signal_threshold);
     let sample: Vec<&str> = ranked.iter().take(config.max_chunks).map(|c| c.text.as_str()).collect();
     let context = sample.join("\n---\n");
+
+    /* if raw_term.contains("philosopher") {
+        eprintln!("DEBUG philosopher chunk_indices: {:?}", concept_chunk_indices);
+        eprintln!("DEBUG chunk count: {}", concept_chunk_indices.len());
+        eprintln!("DEBUG top 10 selected source_lines: {:?}",
+            ranked.iter().take(10).map(|c| c.source_line).collect::<Vec<_>>());
+    } */
 
     let prompt = build_summarize_prompt(raw_term, &context);
     let response = chat(&prompt, &config.summarize_model, config)?;
@@ -237,7 +258,7 @@ pub fn enrich_concept(
     strengths: &HashMap<String, f64>,
     config: &EnrichConfig,
 ) -> Result<(), EnrichError> {
-    let description = summarize_concept(&concept.raw_term, concept_chunk_indices, all_chunks, all_terms, strengths, config)?;
+    let description = summarize_concept(&concept.raw_term, &concept.source_path, concept_chunk_indices, all_chunks, all_terms, strengths, config)?;
     let label = name_concept(&concept.raw_term, &description, config)?;
 
     concept.description = description;

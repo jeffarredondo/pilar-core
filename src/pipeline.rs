@@ -223,7 +223,7 @@ fn print_progress(current: usize, total: usize) {
 
 /// Writes every shard to disk as shard-N.km, plus registry.km.
 /// No shard is special — shard-0 is written the same way as shard-22.
-pub fn write_all(result: &PlacementResult, registry: &ShardRegistry, config: &PipelineConfig) -> Result<(), PipelineError> {
+pub fn write_all(result: &PlacementResult, registry: &ShardRegistry, config: &PipelineConfig, embedding_dim: usize) -> Result<(), PipelineError> {
     std::fs::create_dir_all(&config.output_dir)?;
 
     for (shard_id, concepts) in &result.shards {
@@ -231,7 +231,12 @@ pub fn write_all(result: &PlacementResult, registry: &ShardRegistry, config: &Pi
         km::write_shard(concepts, shard_id, &path)?;
     }
 
-    km::write_registry(registry, &config.output_dir.join("registry.km"))?;
+    km::write_registry(
+        registry,
+        &config.output_dir.join("registry.km"),
+        config.placement.projection_seed,
+        embedding_dim,
+    )?;
 
     Ok(())
 }
@@ -248,6 +253,7 @@ pub fn run(source_paths: &[PathBuf], config: &PipelineConfig) -> Result<(), Pipe
     let t1 = Instant::now();
     let embeddings = embed_terms(&scores, &config.embed)?;
     println!("embed: {:?} ({} embeddings)", t1.elapsed(), embeddings.len());
+    let embedding_dim = embeddings.values().next().map(|e| e.len()).unwrap_or(768);
 
     let t2 = Instant::now();
     let mut registry = ShardRegistry::new();
@@ -264,7 +270,7 @@ pub fn run(source_paths: &[PathBuf], config: &PipelineConfig) -> Result<(), Pipe
     println!("enrich: {:?}", t3.elapsed());
 
     let t4 = Instant::now();
-    write_all(&result, &registry, config)?;
+    write_all(&result, &registry, config, embedding_dim)?;
     println!("write: {:?}", t4.elapsed());
 
     println!("total: {:?}", t0.elapsed());
@@ -418,7 +424,7 @@ mod tests {
         let mut registry = ShardRegistry::new();
         let result = place_corpus(&scores, &embeddings, &config.placement, &mut registry);
 
-        write_all(&result, &registry, &config).unwrap();
+        write_all(&result, &registry, &config, 4).unwrap();
 
         // manifold should land in shard-0 (near origin, within shard_radius)
         assert!(dir.join("shard-0.km").exists());
