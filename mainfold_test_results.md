@@ -70,6 +70,8 @@ All three generation models tested against the same km_output enriched with gemm
 
 **The only query AL wins cleanly:** Q1 2026 revenue & loss — because spaCy extracted `q1 financial results (2026)` as a direct named entity. Pilar has `2024`, `result`, `31 2026` — close but not precise enough to surface the exact figures.
 
+**Note** - Bare gemma3:4b confidently hallucinated answers to the same baseline questions and cited fake sources.
+
 ---
 
 ## Key Finding
