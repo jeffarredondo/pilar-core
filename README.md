@@ -21,16 +21,16 @@ See `thesis.md` for the full argument.
 - [x] `types.rs` — `Concept`, `ManifoldCoord`, `GeometryConfidence`, all serde-derived; `embedding` field has `#[serde(skip)]` — used at ingest, never written to disk
 - [x] `placement.rs` — classifies geometry via eigenvalue signature + Gromov delta; everything places into H³; ambiguous concepts (delta ≥ 0.15) get radius penalty toward boundary; routes all concepts through registry
 - [x] `ngram.rs` (formerly `ner.rs`) — sliding-window n-gram extraction; edges-only rule: first and last token must be non-stopwords, internal stopwords allowed; `NgramConfig { max_n: 3 }`
-- [x] `spacy_ner.rs` — real named-entity recognition via an embedded Python + spaCy (`en_core_web_sm`), loaded once via PyO3; whitelists ORG/PERSON/GPE/PRODUCT/EVENT/DATE/MONEY
+- [x] `spacy_ner.rs` — real named-entity recognition via an embedded Python + spaCy (`en_core_web_sm`), loaded once via PyO3; whitelists ORG/PERSON/GPE/PRODUCT/EVENT/DATE/MONEY. Hardened against real filing text: whitespace/newline artifacts inside an entity are collapsed (`normalize_entity_text`), financial-table bleed-through producing multi-`$` MONEY entities is filtered out (`is_table_bleed_money`), and SEC-style parenthetical negatives (`$(1,943) million`, which spaCy strips the sign from) are repaired back to a signed figure (`repair_parenthetical_negative_money`). Also works around a macOS-specific PyO3 issue where the embedded interpreter fails to find the active venv's site-packages at runtime (`ensure_venv_site_packages_on_path`); not seen on Linux.
 - [x] `extraction.rs` — hybrid extractor: unions `ngram.rs` (domain compounds spaCy has no label for) with `spacy_ner.rs` (precise entity anchors n-grams fragment); degrades to n-grams-only with a stderr warning if spaCy isn't installed
 - [x] `tfidf.rs` — per-corpus term scoring with `min_occurrences` floor; `normalize_to_strength` produces [0,1] signal
-- [x] `embed.rs` — Ollama `/api/embed` client
+- [x] `embed.rs` — Ollama `/api/embed` client. Terms are embedded with source context, not bare (`pipeline.rs::build_embedding_input` pairs each term with up to 300 chars of its source chunk) — a bare short/numeric term like `$4,694 million` carries too little semantic signal on its own to be retrieved by a natural-language query.
 - [x] `ingest.rs` — character-indexed sliding-window chunker
 - [x] `enrich.rs` — weighted chunk ranking by TF-IDF signal strength (not count); source-isolated chunk selection (no cross-corpus bleed); small-model description + larger-model naming via Ollama
 - [x] `km.rs` — shard + registry read/write via TOML; `registry.km` stores `projection_seed` and `embedding_dim`
 - [x] `pipeline.rs` — orchestration with timing per stage and live progress bar; `max_concepts_per_source` caps per corpus before pooling
 - [x] `main.rs` — CLI binary with multi-file support and `--dry-run`
-- [x] `src/bin/infer.rs` — inference binary; loads registry + shards, embeds query, projects to H³, finds nearest shards, ranks by Poincaré distance, injects top-5 as context, calls LLM for grounded answer
+- [x] `src/bin/infer.rs` — inference binary; loads registry + shards, embeds query, projects to H³, finds nearest shards, ranks by Poincaré distance, injects top-5 as context, calls LLM for grounded answer. Full (untruncated) descriptions go into the RAG prompt; the old `.chars().take(100)` was truncating descriptions *before* they reached the prompt, not just at display — the LLM never saw anything past character 100. Truncation now happens only at print time.
 
 ---
 
@@ -74,7 +74,7 @@ Config lives in `pilar.toml` at project root (same level as `Cargo.toml`). Dry-r
 
 ---
 
-## Design decisions worth not relitigating
+## Design decisions
 
 **M = H³, not M = H³ × S¹ × ℝ¹.** We tested the product manifold. S¹ and ℝ¹ activated only as artifacts of classification thresholds, not genuine structural signals. H³ is sufficient — cyclical and linear structure emerges as angular clustering and radial gradients within the ball. Sharding handles the periphery organically.
 
@@ -114,6 +114,8 @@ Shard structure reflected genuine semantic clustering. Brandenburg's domain voca
 ---
 
 ## Known gaps
+
+**Resolved since the June 28 handoff:** hybrid extraction (n-gram ∪ spaCy NER) is built and validated end-to-end against real corpora; spaCy MONEY-entity noise (whitespace bleed, table bleed, sign-stripped parenthetical negatives) is cleaned up; term embeddings now carry source-chunk context instead of being embedded bare; and the `infer.rs` prompt-truncation bug is fixed. See git history / session notes for details — not re-litigating any of it here.
 
 - **N-gram-only noise still present** — the hybrid extractor's n-gram half still surfaces generic fragments (`result`, `segment`, `remained`, `4,694 million driven`) that TF-IDF has to filter after the fact. spaCy's entities (`elon musk`, `$4,694 million`) don't have this problem, but they only cover the labeled entity types — a frequency ceiling on the n-gram side is still worth revisiting.
 - **Multi-corpus chunk ranking bug** — weighted ranking works on single corpus; cross-corpus strength normalization may dilute domain-specific terms in multi-corpus runs.
