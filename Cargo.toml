@@ -18,6 +18,23 @@ toml = "0.8"
 # dependency this adds).
 pyo3 = { version = "0.23", features = ["auto-initialize"] }
 
+# pilar-server (MCP/HTTP wrapper around the pipeline) dependencies below.
+# The pipeline itself (embed.rs, enrich.rs) stays synchronous/blocking --
+# reqwest::blocking -- so pilar_server.rs runs those calls via
+# tokio::task::spawn_blocking rather than converting the pipeline to async.
+rmcp = { version = "3.4.1", features = ["server", "macros", "transport-streamable-http-server"] }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+schemars = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 [[bin]]
 name = "infer"
 path = "src/bin/infer.rs"
+
+[[bin]]
+name = "pilar-server"
+path = "src/bin/pilar_server.rs"
