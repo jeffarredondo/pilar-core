@@ -47,7 +47,7 @@ pub struct ScoredTerm {
 
 // ── TF-IDF ────────────────────────────────────────────────────────────────────
 
-/// Scores every term ner.rs extracted, using chunks as documents — IDF
+/// Scores every term extraction.rs produced, using chunks as documents — IDF
 /// measures how many chunks a term shows up in, not how many separate
 /// source files. A term that appears in nearly every chunk scores near
 /// zero (it's noise, not signal); a term concentrated in a few chunks
@@ -59,7 +59,7 @@ pub struct ScoredTerm {
 /// is pure counting, cheap enough to just redo from scratch rather than
 /// maintain state that could drift from whatever's actually on disk.
 ///
-/// `terms_per_chunk` is ner.rs's extract_terms output, one HashSet per
+/// `terms_per_chunk` is extraction.rs's extract_terms output, one HashSet per
 /// chunk, same indices as `chunks`.
 pub fn compute(chunks: &[Chunk], terms_per_chunk: &[std::collections::HashSet<String>], config: &TfidfConfig) -> Vec<ScoredTerm> {
     debug_assert_eq!(chunks.len(), terms_per_chunk.len());

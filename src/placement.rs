@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 // ── Input contract ────────────────────────────────────────────────────────────
 
-/// What ner.rs + tfidf.rs + embed.rs produce together — a term with its
+/// What extraction.rs + tfidf.rs + embed.rs produce together — a term with its
 /// embedding attached and a pre-normalized strength value. `strength`
 /// arrives already normalized to [0, 1] — placement doesn't know or care
 /// whether it came from TF-IDF, access-count decay, or anything else.

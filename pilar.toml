@@ -1,9 +1,9 @@
 output_dir = "./km_output"
-max_concepts_per_source = 100
+max_concepts_per_source = 200
 
 [ingest]
 chunk_size = 2000
-overlap = 200
+overlap = 100
 
 [tfidf]
 min_occurrences = 10
@@ -19,8 +19,8 @@ projection_seed = 42
 
 [enrich]
 base_url = "http://localhost:11434"
-summarize_model = "mistral"
-name_model = "mistral"
+summarize_model = "gemma3:4b"
+name_model = "gemma3:4b"
 max_chunks = 5
 signal_threshold = 0.5
 

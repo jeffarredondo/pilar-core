@@ -20,7 +20,9 @@ See `thesis.md` for the full argument.
 - [x] `sharding.rs` — full spatial index; `ShardRegistry::new()` pre-registers shard-0 at origin; `nearest_shards(position, top_k)` for lazy loading; `load()` resumes across runs without ID collision
 - [x] `types.rs` — `Concept`, `ManifoldCoord`, `GeometryConfidence`, all serde-derived; `embedding` field has `#[serde(skip)]` — used at ingest, never written to disk
 - [x] `placement.rs` — classifies geometry via eigenvalue signature + Gromov delta; everything places into H³; ambiguous concepts (delta ≥ 0.15) get radius penalty toward boundary; routes all concepts through registry
-- [x] `ner.rs` — sliding-window n-gram extraction; edges-only rule: first and last token must be non-stopwords, internal stopwords allowed; `NerConfig { max_n: 3 }`
+- [x] `ngram.rs` (formerly `ner.rs`) — sliding-window n-gram extraction; edges-only rule: first and last token must be non-stopwords, internal stopwords allowed; `NgramConfig { max_n: 3 }`
+- [x] `spacy_ner.rs` — real named-entity recognition via an embedded Python + spaCy (`en_core_web_sm`), loaded once via PyO3; whitelists ORG/PERSON/GPE/PRODUCT/EVENT/DATE/MONEY
+- [x] `extraction.rs` — hybrid extractor: unions `ngram.rs` (domain compounds spaCy has no label for) with `spacy_ner.rs` (precise entity anchors n-grams fragment); degrades to n-grams-only with a stderr warning if spaCy isn't installed
 - [x] `tfidf.rs` — per-corpus term scoring with `min_occurrences` floor; `normalize_to_strength` produces [0,1] signal
 - [x] `embed.rs` — Ollama `/api/embed` client
 - [x] `ingest.rs` — character-indexed sliding-window chunker
@@ -35,11 +37,11 @@ See `thesis.md` for the full argument.
 ## Pipeline
 
 ```
-ingest → ner → tfidf → embed → placement → sharding → enrich → km
+ingest → extraction (ngram + spacy_ner) → tfidf → embed → placement → sharding → enrich → km
 ```
 
 1. `ingest.rs` — chunk source text (character-indexed sliding window, 2000 chars, 200 overlap)
-2. `ner.rs` — extract n-gram candidates per chunk (edges-only stopword rule, max_n=3)
+2. `extraction.rs` — per chunk, union `ngram.rs`'s n-gram candidates (edges-only stopword rule, max_n=3) with `spacy_ner.rs`'s named entities
 3. `tfidf.rs` — score terms per corpus, filter by `min_occurrences`
 4. `embed.rs` — embed each surviving term via Ollama (`nomic-embed-text`)
 5. `placement.rs` — classify geometry, project to H³ coordinates, route through `sharding.rs`
@@ -113,10 +115,10 @@ Shard structure reflected genuine semantic clustering. Brandenburg's domain voca
 
 ## Known gaps
 
-- **N-gram extraction quality** — generic terms (`result`, `segment`, `remained`) survive TF-IDF filtering and pollute retrieval. Named entity bias or frequency ceiling needed.
+- **N-gram-only noise still present** — the hybrid extractor's n-gram half still surfaces generic fragments (`result`, `segment`, `remained`, `4,694 million driven`) that TF-IDF has to filter after the fact. spaCy's entities (`elon musk`, `$4,694 million`) don't have this problem, but they only cover the labeled entity types — a frequency ceiling on the n-gram side is still worth revisiting.
 - **Multi-corpus chunk ranking bug** — weighted ranking works on single corpus; cross-corpus strength normalization may dilute domain-specific terms in multi-corpus runs.
 - **Model speed** — mistral 7B (~55 min for 226 concepts) is slow. gemma3:4b pulled locally, not yet tested.
-- **Three-way thesis experiment** — not yet run cleanly. Need extraction quality fixed first.
+- **Three-way thesis experiment** — not yet run cleanly. Now unblocked by the hybrid extractor — worth rerunning.
 - **pilar-server** — HTTP layer not built yet.
 - **Iterative ingestion** — infrastructure supports it, pipeline doesn't wire it.
 - **Vacuum step** — consolidating subsuming n-grams, pruning decayed concepts. Future maintenance pass.
@@ -125,7 +127,15 @@ Shard structure reflected genuine semantic clustering. Brandenburg's domain voca
 
 ## Dependencies
 
-`nalgebra` · `rand` + `rand_distr` · `stop-words` · `reqwest` · `serde` + `serde_json` · `toml`
+`nalgebra` · `rand` + `rand_distr` · `stop-words` · `reqwest` · `serde` + `serde_json` · `toml` · `pyo3` (Python embedding for spaCy NER)
+
+`pyo3` requires Python 3.8+ and `en_core_web_sm` in the runtime environment (the same interpreter `python3` resolves to at build time — set `PYO3_PYTHON` if you need to pin a specific one). Install with:
+
+```bash
+pip install spacy && python3 -m spacy download en_core_web_sm
+```
+
+If spaCy isn't installed, the pipeline still runs — `extraction.rs` logs a warning to stderr once and falls back to n-gram extraction only. This is a real runtime dependency for a research system, not a bug; the hybrid mode is strictly better when spaCy is present.
 
 ## References
 [Poincaré Embeddings for

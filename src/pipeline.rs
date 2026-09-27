@@ -6,9 +6,9 @@ use std::path::Path;
 
 use crate::embed::{self, EmbedConfig, EmbedError};
 use crate::enrich::{self, EnrichConfig, EnrichError};
+use crate::extraction;
 use crate::ingest::{self, IngestConfig};
 use crate::km::{self, KmError};
-use crate::ner;
 use crate::placement::{self, EmbeddedTerm, PlacementConfig, PlacementResult};
 use crate::sharding::ShardRegistry;
 use crate::tfidf::{self, ScoredTerm, TfidfConfig};
@@ -117,14 +117,14 @@ impl From<KmError> for PipelineError {
 /// that the top N per source already represents the high signal-density
 /// concepts worth placing.
 pub fn ingest_and_score(source_paths: &[PathBuf], config: &PipelineConfig) -> Result<(Vec<Chunk>, Vec<ScoredTerm>), PipelineError> {
-    let extractor = ner::build_extractor();
+    let extractor = extraction::build_hybrid_extractor();
     let mut all_chunks = Vec::new();
     let mut all_scores = Vec::new();
 
     for path in source_paths {
         let chunks = ingest::chunk_file(path, &config.ingest)?;
         let terms_per_chunk: Vec<HashSet<String>> = chunks.iter()
-            .map(|c| ner::extract_terms(&c.text, &extractor))
+            .map(|c| extraction::extract_terms(&c.text, &extractor))
             .collect();
         let mut scores = tfidf::compute(&chunks, &terms_per_chunk, &config.tfidf);
 
@@ -141,12 +141,57 @@ pub fn ingest_and_score(source_paths: &[PathBuf], config: &PipelineConfig) -> Re
 
 // ── Stage 2: embedding ────────────────────────────────────────────────────────
 
-/// Embeds every scored term via Ollama. Aborts on the first failure rather
-/// than skipping and continuing — matches the Python prototype's behavior.
-pub fn embed_terms(scores: &[ScoredTerm], config: &EmbedConfig) -> Result<HashMap<String, Vec<f64>>, PipelineError> {
+/// How much of the source chunk to attach to a bare term before embedding
+/// it. Long enough to give a numeral or date actual semantic context to
+/// hang off of; short enough that it doesn't wash out the term itself or
+/// pull in unrelated content from later in the chunk.
+const EMBEDDING_CONTEXT_CHARS: usize = 300;
+
+/// Builds the string actually sent to the embedding model for one term:
+/// the term itself plus a snippet of the chunk it was found in.
+///
+/// A bare term like "spacex" or "starlink" is a real word an embedding
+/// model has something to do with. A bare term like "$4,694 million" or
+/// "december 31 2025" is not -- it's syntactically clean (that's what the
+/// spaCy NER fix bought) but semantically inert in isolation: nothing in
+/// the string itself says whether it's revenue, a loss, a share price, or
+/// a date of incorporation. Embedded alone, every such concept lands in
+/// roughly the same generic "financial-number-shaped-text" region of the
+/// space regardless of what it actually means, which is why a query like
+/// "SpaceX's Q1 2026 revenue" could fail to retrieve a genuine revenue
+/// figure that exists in the manifold: the number's embedding never had
+/// the word "revenue" anywhere near it.
+///
+/// Falls back to the bare term if, for some reason, chunk_indices is empty
+/// or the index is out of range -- should not happen given how ScoredTerm
+/// is constructed in tfidf.rs, but this shouldn't panic if it ever does.
+fn build_embedding_input(term: &ScoredTerm, chunks: &[Chunk]) -> String {
+    let snippet = term
+        .chunk_indices
+        .first()
+        .and_then(|&i| chunks.get(i))
+        .map(|c| c.text.chars().take(EMBEDDING_CONTEXT_CHARS).collect::<String>());
+
+    match snippet {
+        Some(s) if !s.is_empty() => format!("{}: {}", term.term, s),
+        _ => term.term.clone(),
+    }
+}
+
+/// Embeds every scored term via Ollama, each one paired with a snippet of
+/// its source context rather than embedded bare (see build_embedding_input).
+/// Aborts on the first failure rather than skipping and continuing --
+/// matches the Python prototype's behavior.
+///
+/// The query side (infer.rs) still embeds raw natural-language queries
+/// unmodified -- that asymmetry is intentional. A real question already
+/// has semantic content; it's only the bare extracted term that needed
+/// help.
+pub fn embed_terms(scores: &[ScoredTerm], chunks: &[Chunk], config: &EmbedConfig) -> Result<HashMap<String, Vec<f64>>, PipelineError> {
     let mut embeddings = HashMap::with_capacity(scores.len());
     for term in scores {
-        let vec = embed::embed(&term.term, config)?;
+        let input = build_embedding_input(term, chunks);
+        let vec = embed::embed(&input, config)?;
         embeddings.insert(term.term.clone(), vec);
     }
     Ok(embeddings)
@@ -251,7 +296,7 @@ pub fn run(source_paths: &[PathBuf], config: &PipelineConfig) -> Result<(), Pipe
     let strengths = tfidf::normalize_to_strength(&scores);
 
     let t1 = Instant::now();
-    let embeddings = embed_terms(&scores, &config.embed)?;
+    let embeddings = embed_terms(&scores, &chunks, &config.embed)?;
     println!("embed: {:?} ({} embeddings)", t1.elapsed(), embeddings.len());
     let embedding_dim = embeddings.values().next().map(|e| e.len()).unwrap_or(768);
 
@@ -293,6 +338,69 @@ mod tests {
 
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("pilar_test_pipeline_{label}_{}.txt", std::process::id()))
+    }
+
+    // ── build_embedding_input ────────────────────────────────────────────────
+
+    fn chunk_at(text: &str) -> Chunk {
+        Chunk {
+            text: text.to_string(),
+            source_path: PathBuf::from("t.txt"),
+            source_line: None,
+        }
+    }
+
+    fn scored_term_with_chunks(term: &str, chunk_indices: Vec<usize>) -> ScoredTerm {
+        ScoredTerm {
+            term: term.to_string(),
+            tfidf: 1.0,
+            chunk_indices,
+            source_path: PathBuf::from("t.txt"),
+            source_line: None,
+        }
+    }
+
+    #[test]
+    fn test_embedding_input_prefixes_term_with_source_snippet() {
+        let chunks = vec![chunk_at("SpaceX reported Q1 2026 revenue of $4,694 million.")];
+        let term = scored_term_with_chunks("$4,694 million", vec![0]);
+
+        let input = build_embedding_input(&term, &chunks);
+
+        assert!(input.starts_with("$4,694 million: "), "got: {input}");
+        assert!(input.contains("revenue"), "got: {input}");
+    }
+
+    #[test]
+    fn test_embedding_input_truncates_long_chunks() {
+        let long_text = "x".repeat(1000);
+        let chunks = vec![chunk_at(&long_text)];
+        let term = scored_term_with_chunks("x", vec![0]);
+
+        let input = build_embedding_input(&term, &chunks);
+
+        // "term: " prefix plus at most EMBEDDING_CONTEXT_CHARS of snippet.
+        assert!(input.chars().count() <= "x: ".len() + EMBEDDING_CONTEXT_CHARS);
+    }
+
+    #[test]
+    fn test_embedding_input_falls_back_to_bare_term_when_chunk_index_missing() {
+        let chunks: Vec<Chunk> = vec![];
+        let term = scored_term_with_chunks("orphaned", vec![0]);
+
+        let input = build_embedding_input(&term, &chunks);
+
+        assert_eq!(input, "orphaned");
+    }
+
+    #[test]
+    fn test_embedding_input_falls_back_to_bare_term_when_no_chunk_indices() {
+        let chunks = vec![chunk_at("some text")];
+        let term = scored_term_with_chunks("orphaned", vec![]);
+
+        let input = build_embedding_input(&term, &chunks);
+
+        assert_eq!(input, "orphaned");
     }
 
     #[test]

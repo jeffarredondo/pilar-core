@@ -16,14 +16,14 @@ fn build_stopword_set() -> HashSet<String> {
 /// parameter rather than a compile-time constant — the right value isn't
 /// known yet and needs to be determined empirically by running real corpora
 /// through different sizes and inspecting output. Start with 3 and adjust.
-pub struct NerConfig {
+pub struct NgramConfig {
     /// Maximum n-gram length to emit. Unigrams (n=1) through max_n are
     /// all candidates — corpus-wide TF-IDF and min_occurrences do the
     /// actual curation, not this layer.
     pub max_n: usize,
 }
 
-impl Default for NerConfig {
+impl Default for NgramConfig {
     fn default() -> Self {
         Self { max_n: 3 }
     }
@@ -90,11 +90,11 @@ fn ngram_terms(tokens: &[String], stopwords: &HashSet<String>, max_n: usize) -> 
 /// in a corpus rather than reconstructed per call.
 pub struct Extractor {
     stopwords: HashSet<String>,
-    config: NerConfig,
+    config: NgramConfig,
 }
 
 impl Extractor {
-    pub fn new(config: NerConfig) -> Self {
+    pub fn new(config: NgramConfig) -> Self {
         Self {
             stopwords: build_stopword_set(),
             config,
@@ -104,7 +104,7 @@ impl Extractor {
 
 impl Default for Extractor {
     fn default() -> Self {
-        Self::new(NerConfig::default())
+        Self::new(NgramConfig::default())
     }
 }
 
@@ -132,7 +132,7 @@ pub fn build_extractor() -> Extractor {
 
 /// Builds the extractor with explicit config — use this when you want to
 /// compare max_n values across runs rather than taking the default.
-pub fn build_extractor_with_config(config: NerConfig) -> Extractor {
+pub fn build_extractor_with_config(config: NgramConfig) -> Extractor {
     Extractor::new(config)
 }
 
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_max_n_config_respected() {
-        let extractor = build_extractor_with_config(NerConfig { max_n: 1 });
+        let extractor = build_extractor_with_config(NgramConfig { max_n: 1 });
         let text = "orbital mechanics governs trajectories.";
         let terms = extract_terms(text, &extractor);
         // With max_n=1, no multi-word phrases should appear.
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_max_n_2_produces_bigrams() {
-        let extractor = build_extractor_with_config(NerConfig { max_n: 2 });
+        let extractor = build_extractor_with_config(NgramConfig { max_n: 2 });
         let text = "orbital mechanics governs trajectories.";
         let terms = extract_terms(text, &extractor);
         assert!(terms.iter().any(|t| t.contains(' ')), "got: {:?}", terms);

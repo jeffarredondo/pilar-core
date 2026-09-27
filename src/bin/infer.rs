@@ -77,6 +77,14 @@ fn main() {
             }
         }
 
+        // Full, untruncated description here -- this is what actually goes
+        // into the RAG prompt below. Truncating at this point (the old
+        // `.chars().take(100)`) meant the LLM never saw anything past the
+        // 100th character of a concept's description, silently cutting off
+        // facts (a dollar figure, a date) that happened to land later in
+        // the sentence -- indistinguishable from the concept just not
+        // having that information, except the model would then confabulate
+        // something plausible-looking instead of saying so.
         let mut ranked: Vec<(f64, String, String, String)> = Vec::new();
         for shard in &loaded_shards {
             for (_, concept) in &shard.concepts {
@@ -86,7 +94,7 @@ fn main() {
                         dist,
                         concept.raw_term.clone(),
                         concept.label.clone(),
-                        concept.description.chars().take(100).collect(),
+                        concept.description.clone(),
                     ));
                 }
             }
@@ -94,10 +102,14 @@ fn main() {
 
         ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
+        // Truncation lives here now -- print-only, never touches what the
+        // model receives.
         println!("Top 5 nearest concepts:");
         for (dist, raw_term, label, desc) in ranked.iter().take(5) {
+            let preview: String = desc.chars().take(100).collect();
+            let ellipsis = if desc.chars().count() > 100 { "..." } else { "" };
             println!("  [{dist:.4}] {raw_term} -> \"{label}\"");
-            println!("           {desc}...");
+            println!("           {preview}{ellipsis}");
         }
         println!();
 
